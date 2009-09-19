@@ -19,9 +19,17 @@ my $addresstolisten=shift;
 my $porttolisten=shift;
 my $addresstoconnect=shift;
 my $porttoconnect=shift;
-die("Usage: socksredirect address_to_listen port_to_listen address_of_socks_server [user password]\nPreparation: iptables -t nat -A OUTPUT -p tcp -d destination_to_be_socksified -j REDIERCT --to-ports port_to_listen\n") unless $porttoconnect;
+die("Usage: socksredirect address_to_listen port_to_listen address_of_socks_server [user password [oneround]]\nPreparation: iptables -t nat -A OUTPUT -p tcp -d destination_to_be_socksified -j REDIERCT --to-ports port_to_listen\n") unless $porttoconnect;
 my $user=shift;
 my $password=shift;
+my $mode=shift||"";
+
+sub SIGPIPE {
+    # just ignore it. The writer will handle.
+    print STDERR "SIGPIPE!\n";
+    $SIG{PIPE}=\&SIGPIPE;
+}
+$SIG{PIPE}=\&SIGPIPE;
 
 
 socket(SS, AF_INET, SOCK_STREAM, 0)  or die "socket: $!";
@@ -40,6 +48,7 @@ my $rin = my $win = my $ein = '';
 vec($rin,fileno(SS),1) = 1;
 
 sub establishsocks_init($);
+sub establishsocks_oneround($);
 
 for(;;){
     my $nfound;
@@ -95,15 +104,22 @@ for(;;){
 		    destport=>$destport,
 		    peer=>$s,
 		    so=>$so,
-		    state=>\&establishsocks_init,
+		    state=>($mode eq "oneround")?\&establishsocks_init_oneround:\&establishsocks_init,
 		    errortext=>"",
 		    bindip=>"",
 		    bindport=>"",
 		};
 		
 		$si->{state}($si);  # Call establishsocks_init
-		$socksinfo{fileno($so)}=$si; # When this disappear, portmapping begins
+		$socksinfo{fileno($so)}=$si;
 		vec($rin, fileno($so), 1)=1;
+
+		if($si->{oneround}) {
+		    # Setup sending end to enable early request transmission
+		    vec($rin, fileno($s), 1)=1;
+		    $portmap{fileno($s)}=$so;
+		    $portmap{fileno($so)}=$s;
+		}
 		# wait for reply from SOCKS server, serving other requests
 
 	    } else {
@@ -153,6 +169,7 @@ for(;;){
 
     # Looks for portmappers (already negotiated with SOCKS server)
     foreach my $i (keys %portmap) {
+	next if exists $socksinfo{$i}; # avoid sending to clients negotiation requests from SOCKS server (oneround mode)
 	if(vec($rout,$i,1)) {
 	    my $writesock     = $portmap{$i};
 	    my $readsock      = $portmap{fileno($writesock)};
@@ -205,7 +222,9 @@ sub es_finalizing($);
 sub establishsocks_init($) {
     my $self = shift;
     my $so = $self->{so};
-    unless ($self->{user}) {
+    
+    $self->{oneround}=0;
+    unless ($self->{souser}) {
 	print $so pack("CCC", 5, 1, 0);
         $self->{state} = \&es_noauth;
     } else {
@@ -238,8 +257,8 @@ sub es_userauth($) {
     my $self = shift;
     my $so = $self->{so};
     my $buf;    
-    my $user = $self->{user};
-    my $password = $self->{password};
+    my $user = $self->{souser};
+    my $password = $self->{sopassword};
 
 
     read $so, $buf, 2;
@@ -254,8 +273,10 @@ sub es_userauth($) {
 	$self->{errortext} = "auth method $method? (should be 2 - username/password)";
 	return;
     }
-
-    print $so pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
+    
+    unless($self->{oneround}) {
+	print $so pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
+    }
 
     $self->{state} = \&es_userauth_recv;
 }
@@ -292,7 +313,9 @@ sub es_readytosend($) {
         +----+-----+-------+------+----------+----------+
 =cut
 
-    print $so pack("CCCC", 5, 1, 0, 1).inet_aton($self->{destip}).pack("n", $self->{destport});
+    unless($self->{oneround}) {
+	print $so pack("CCCC", 5, 1, 0, 1).inet_aton($self->{destip}).pack("n", $self->{destport});
+    }
     $self->{state} = \&es_finalizing;
 }
 
@@ -346,4 +369,26 @@ sub es_finalizing($) {
     $self->{bindport} = $bndp;
 
     $self->{state} = undef; # finish negotiation
+}
+
+sub es_oneround_noauth($);
+sub es_oneround_userauth($);
+
+sub establishsocks_init_oneround($) {
+    my $self = shift;
+    my $so = $self->{so};
+    my $user = $self->{souser};
+    my $password = $self->{sopassword};
+
+    $self->{oneround}=1;
+    unless ($self->{souser}) {
+	print $so pack("CCC", 5, 1, 0);
+	print $so pack("CCCC", 5, 1, 0, 1).inet_aton($self->{destip}).pack("n", $self->{destport});
+        $self->{state} = \&es_noauth;
+    } else {
+	print $so pack("CCC", 5, 1, 2); 
+	print $so pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
+	print $so pack("CCCC", 5, 1, 0, 1).inet_aton($self->{destip}).pack("n", $self->{destport});
+	$self->{state} = \&es_userauth;
+    }
 }
