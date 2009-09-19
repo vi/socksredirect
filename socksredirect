@@ -52,13 +52,14 @@ for(;;){
     die("select: $!") if $nfound==-1;
     
     if(vec($rout,fileno(SS),1)){
-	my $paddr = accept(S, SS);
+	my $s;
+	my $paddr = accept($s, SS);
 	my($port,$iaddr) = sockaddr_in($paddr);
 
 	my $srcip = inet_ntoa($iaddr);
 	my $srcport = $port;
 
-        print STDERR "$srcip:$port -> ";
+        print STDOUT "$srcip:$port -> ";
 
 	my $destip;
 	my $destport;
@@ -70,23 +71,22 @@ for(;;){
 	close F;
 
 	unless($destip and $destport) {
-	    print STDERR "NULL?\n";
-	    print S "Sorry, this port is intended to be connected using conntrack\n";
-	    close S;
+	    print STDOUT "NULL?\n";
+	    print $s "Sorry, this port is intended to be connected using conntrack\n";
+	    close $s;
 	} else {
-	    print STDERR "$destip:$destport";
+	    print STDOUT "$destip:$destport\n";
+	    #my $si = { saddr=>$addresstoconnect, s
 	    my $so = establishsocks($addresstoconnect, $porttoconnect, $user, $password, $destip, $destport);
 	    unless($so){
-		print STDERR " (FAILED)\n";
-		print S "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect (Requesting for $destip:$destport)\n";
-		close S;
+		print $s "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect (Requesting for $destip:$destport)\n";
+		close $s;
 	    } else {
-		print STDERR "\n";
-		vec($rin,fileno(S),1)=1;
+		vec($rin,fileno($s),1)=1;
 		vec($rin,fileno($so),1)=1;
-		$portmap{fileno(S)}=$so;
-		$portmap{fileno($so)}=*S;
-		unshift @sockets, *S;
+		$portmap{fileno($s)}=$so;
+		$portmap{fileno($so)}=$s;
+		unshift @sockets, $s;
 		unshift @sockets, $so;
 	    }
 	}
@@ -114,60 +114,61 @@ for(;;){
 
 
 sub establishsocks($$$$$$) {
+    my $so;
     my ($addresstoconnect, $porttoconnect, $user, $password, $destip, $destport) = @_;
 
-    socket(SO, AF_INET, SOCK_STREAM, 0) or return undef;
-    connect(SO, sockaddr_in($porttoconnect, inet_aton($addresstoconnect))) or return undef;
-    select SO;
+    socket($so, AF_INET, SOCK_STREAM, 0) or return undef;
+    connect($so, sockaddr_in($porttoconnect, inet_aton($addresstoconnect))) or return undef;
+    select $so;
     $|=1;
     my $buf;
     unless($user){
-	print SO pack("CCC", 5, 1, 0);
-	read SO, $buf, 2;
+	print $so pack("CCC", 5, 1, 0);
+	read $so, $buf, 2;
 	my ($ver, $method) = unpack "CC", $buf;
 	$ver = -1 unless defined $ver;
 	unless($ver==5) {
 	    print STDERR " (socks version $ver?)";
-	    close SO;
+	    close $so;
 	    return undef;
 	}
 	$method = "EOF" unless defined $ver;
 	unless($method==0) {
 	    print STDERR " (auth method $method?)";
-	    close SO;
+	    close $so;
 	    return undef;
 	}
     } else {
-	print SO pack("CCC", 5, 1, 2);
-	read SO, $buf, 2;
+	print $so pack("CCC", 5, 1, 2);
+	read $so, $buf, 2;
 	my ($ver, $method) = unpack "CC", $buf;
 	$ver = -1 unless defined $ver;
 	unless($ver==5) {
 	    print STDERR " (socks version $ver?)";
-	    close SO;
+	    close $so;
 	    return undef;
 	}
 	$method = -1 unless defined $ver;
 	unless($method==2) {
 	    print STDERR " (auth method $method?)";
-	    close SO;
+	    close $so;
 	    return undef;
 	}
 
 
-	print SO pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
-	read SO, $buf, 2;
+	print $so pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
+	read $so, $buf, 2;
 	my ($authver, $status) = unpack "CC", $buf;
 	$authver = -1 unless defined $authver;
 	unless($authver==1) {
 	    print STDERR " (auth version $authver?)";
-	    close SO;
+	    close $so;
 	    return undef;
 	}
 	$status = -1 unless defined $status;
 	unless($status==0) {
 	    print STDERR " (auth failed $status)";
-	    close SO;
+	    close $so;
 	    return undef;
 	}
     }    
@@ -180,7 +181,7 @@ sub establishsocks($$$$$$) {
         +----+-----+-------+------+----------+----------+
 =cut
 
-    print SO pack("CCCC", 5, 1, 0, 1).inet_aton($destip).pack("n", $destport);
+    print $so pack("CCCC", 5, 1, 0, 1).inet_aton($destip).pack("n", $destport);
 =cut
         +----+-----+-------+------+----------+----------+
         |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
@@ -189,12 +190,12 @@ sub establishsocks($$$$$$) {
         +----+-----+-------+------+----------+----------+
 =cut
 
-    read SO, $buf, 10;
+    read $so, $buf, 10;
     my ($ver, $rep, $rsv, $atyp, $bnd, $bndp) = unpack "CCCCLn", $buf;
     $ver = -1 unless defined $ver;  $rep = -1 unless defined $rep; $atyp = -1 unless defined $atyp;
     unless($ver==5) {
 	print STDERR " (socks version $ver after connect?)";
-	close SO;
+	close $so;
 	return undef;
     }
 =cut
@@ -220,11 +221,11 @@ sub establishsocks($$$$$$) {
 	elsif($rep==7){ print STDERR " (Command not supported)"; }
 	elsif($rep==8){ print STDERR " (Address type not supported)"; }
 	else{ print STDERR " (reply $rep?)"; }
-	close SO;
+	close $so;
 	return undef;
     }
 
     print STDERR " (bound ".inet_ntoa(pack("L",$bnd)).":$bndp)";
 
-    return *SO;
+    return $so;
 }
