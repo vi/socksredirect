@@ -13,8 +13,9 @@
 my $rcsid = ''; $rcsid .= '$Id:$';
 
 use strict;
-use Socket;  
+use Socket qw(IPPROTO_TCP AF_INET SOCK_STREAM SOL_SOCKET SO_REUSEADDR SO_ERROR AF_INET SOCK_STREAM inet_aton sockaddr_in inet_ntoa);  
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use POSIX qw(EINPROGRESS);
 
 my $addresstolisten=shift;
 my $porttolisten=shift;
@@ -35,15 +36,18 @@ $SIG{PIPE}=\&SIGPIPE;
 
 socket(SS, AF_INET, SOCK_STREAM, 0)  or die "socket: $!";
 
-setsockopt(SS, SOL_SOCKET, SO_REUSEADDR, pack("l", 1))   or die "setsockopt: $!";
+setsockopt(SS, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) or die "setsockopt: $!";
 
-#INADDR_ANY
+fcntl(SS, F_SETFL, O_NONBLOCK);
+
 bind(SS, sockaddr_in($porttolisten, inet_aton($addresstolisten))) or die "bind: $!";
 
 listen(SS,0) or die "listen: $!";
 
 my %portmap;
 my %socksinfo;
+my %pendingconnect;
+my %writedebt;
 
 my $rin = my $win = my $ein = '';
 vec($rin,fileno(SS),1) = 1;
@@ -51,68 +55,100 @@ vec($rin,fileno(SS),1) = 1;
 sub establishsocks_init($);
 sub establishsocks_oneround($);
 
-for(;;){
-    my $nfound;
-    $nfound = select(my $rout=$rin, undef, undef, undef);
+sub writer($$$$);
+sub killsock($);
 
-    my $buffer;
-    my $readsock;
-    my $writesock;
-    my $readret;
-    my $writeret;
-    my $offset;
+my $rout = $rin;
+my $wout = $win;
+sub dumpsel();
+
+my $buffer;
+my $readsock;
+my $writesock;
+my $readret;
+my $writeret;
+my $offset;
+
+my $nfound;
+
+my $i;
+for(;;){
+    $nfound = select($rout=$rin, $wout=$win, undef, undef);
 
     die("select: $!") if $nfound==-1;
-    
+
     if(vec($rout,fileno(SS),1)){
+	--$nfound;
 	my $s;
 	my $paddr = accept($s, SS);
-	my($port,$iaddr) = sockaddr_in($paddr);
+	if ($paddr) {
+	    fcntl($s, F_SETFL, O_NONBLOCK);
+	    my($port,$iaddr) = sockaddr_in($paddr);
 
-	my $srcip = inet_ntoa($iaddr);
-	my $srcport = $port;
+	    my $srcip = inet_ntoa($iaddr);
+	    my $srcport = $port;
 
-        print STDOUT "$srcip:$port -> ";
+	    print STDOUT "$srcip:$port -> ";
 
-	my $destip;
-	my $destport;
+	    my $destip;
+	    my $destport;
 
-        open F, "</proc/net/nf_conntrack";
-	while(<F>) {
-	    /src=$srcip dst=([0-9.]+) sport=$srcport dport=(\d+)/ and $destip=$1 and $destport=$2;
-	}
-	close F;
+	    open F, "</proc/net/nf_conntrack";
+	    while(<F>) {
+		/src=$srcip dst=([0-9.]+) sport=$srcport dport=(\d+)/ and $destip=$1 and $destport=$2;
+	    }
+	    close F;
 
-	unless($destip and $destport) {
-	    print STDOUT "NULL?\n";
-	    print $s "Sorry, this port is intended to be connected using conntrack\n";
-	    close $s;
-	} else {
-	    print STDOUT "$destip:$destport\n";
+	    unless($destip and $destport) {
+		print STDOUT "NULL?\n";
+		print $s "Sorry, this port is intended to be connected using conntrack\n";
+		close $s;
+	    } else {
+		print STDOUT "$destip:$destport\n";
 
-	    my $so;
-	    socket($so, AF_INET, SOCK_STREAM, 0) or $so=undef;
-	    if($so && connect($so, sockaddr_in($porttoconnect, inet_aton($addresstoconnect)))) {
-		select $so; $|=1;
-		my $si = { 
-		    soaddr=>$addresstoconnect, 
-		    soport=>$porttoconnect, 
-		    souser=>$user, 
-		    sopassword=>$password, 
-		    srcip=>$srcip,
-		    srcport=>$srcport,
-		    destip=>$destip, 
-		    destport=>$destport,
-		    peer=>$s,
-		    so=>$so,
-		    state=>($mode eq "oneround")?\&establishsocks_init_oneround:\&establishsocks_init,
-		    errortext=>"",
-		    bindip=>"",
-		    bindport=>"",
-		};
-		
+		my $so;
+		socket($so, AF_INET, SOCK_STREAM, 0) or $so=undef;
+		if($so) {
+		    fcntl($so, F_SETFL, O_NONBLOCK);
+		    select $so; $|=1;
+		    connect($so, sockaddr_in($porttoconnect, inet_aton($addresstoconnect)));
+
+		    my $si = { 
+			soaddr=>$addresstoconnect, 
+			soport=>$porttoconnect, 
+			souser=>$user, 
+			sopassword=>$password, 
+			srcip=>$srcip,
+			srcport=>$srcport,
+			destip=>$destip, 
+			destport=>$destport,
+			peer=>$s,
+			so=>$so,
+			state=>($mode eq "oneround")?\&establishsocks_init_oneround:\&establishsocks_init,
+			errortext=>"",
+			bindip=>"",
+			bindport=>"",
+		    };
+		    
+		    $pendingconnect{fileno($so)}=$si;
+		    $socksinfo{fileno($so)}=$si;
+		    vec($win,fileno($so),1)=1;
+		}	    
+	    }
+        }
+    }
+
+    foreach $i (keys %pendingconnect) {
+	if(vec($wout,$i,1)) {
+	    --$nfound;  
+	    vec($win,$i,1)=0;
+	    delete $pendingconnect{$i};
+	    my $si = $socksinfo{$i};
+	    my $s = $si->{peer};
+	    my $so = $si->{so};
+
+	    unless(unpack("I", getsockopt($so, IPPROTO_TCP, SO_ERROR))==0){
 		$si->{state}($si);  # Call establishsocks_init
-		$socksinfo{fileno($so)}=$si;
 		vec($rin, fileno($so), 1)=1;
 
 		if($si->{oneround}) {
@@ -126,14 +162,16 @@ for(;;){
 	    } else {
 		print $s "Error: Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect $!\n";
 		print STDERR "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect $!\n";
-		close $s;
+		killsock($s);
+		killsock($so);
 	    }
-	}
+	}	
     }
     
     # look for not yet negotiated SOCKS connections
-    foreach my $i (keys %socksinfo) {
+    foreach $i (keys %socksinfo) {
 	if(vec($rout,$i,1)) {
+	    --$nfound;
 	    my $si = $socksinfo{$i};
 
 	    # Continue negotiation with SOCKS5
@@ -145,10 +183,8 @@ for(;;){
 	    if($si->{errortext}) {
 		print STDOUT "    $si->{srcip}:$si->{srcport} -> $si->{destip}:$si->{destport} ($si->{errortext})\n";  
 		print $peer "Error: $si->{errortext}\n";
-		vec($rin, fileno($so), 1)=0;
-		delete $socksinfo{fileno($so)}; # Stop SOCKS negotiation phase
-		close $so;
-		close $peer;
+		killsock($so);
+		killsock($peer);
 		next;
 	    }
 
@@ -169,50 +205,110 @@ for(;;){
     }
 
     # Looks for portmappers (already negotiated with SOCKS server)
-    foreach my $i (keys %portmap) {
-	next if exists $socksinfo{$i}; # avoid sending to clients negotiation requests from SOCKS server (oneround mode)
+    foreach $i (keys %portmap) {
 	if(vec($rout,$i,1)) {
+	    next if exists $socksinfo{$i}; # avoid sending to clients negotiation requests from SOCKS server (oneround mode)
+	    --$nfound;
 	    my $writesock     = $portmap{$i};
 	    my $readsock      = $portmap{fileno($writesock)};
 	    unless (fileno($readsock)==$i) {
 		print STDERR "Assertion failed: portmap is not paired?\n";
 	    }
 	    $readret = sysread $readsock, $buffer, 1024;
-	    $offset=0;
-	    if($readret) {
-		while ($readret) {
-		    $writeret = syswrite $writesock, $buffer, $readret, $offset;
-		    unless($writeret) {
-			# Error. Shutting down socket
-			vec($rin,fileno($readsock),1)=0;
-			vec($rin,fileno($writesock),1)=0;
-			delete $portmap{fileno($writesock)};
-			delete $portmap{fileno($readsock)};
-			shutdown($readsock, 2);
-			shutdown($writesock, 2);
-			close $readsock;
-			close $writesock;
-			last;    
-		    }
-		    $readret-=$writeret;
-		    $offset+=$writeret;
-		}
-	    } else {
-		# Shutdown this way
-		vec($rin,fileno($readsock),1)=0;
-		shutdown($readsock, 0);
-		shutdown($writesock, 1);
-		unless (vec($rin,fileno($writesock),1)) {
-		    # close filehandles
-		    delete $portmap{fileno($writesock)};
-		    delete $portmap{fileno($readsock)};
-		    close $readsock;
-		    close $writesock;
-		}
-	    }
+	    writer($readsock, $writesock, $buffer, $readret);
 	}
     }
+
+    foreach $i (keys %writedebt) {
+	if(vec($wout,$i,1)) {
+	    --$nfound;
+	    my $buffer = $writedebt{$i};
+	    my $readsock     = $portmap{$i};
+	    my $writesock    = $portmap{fileno($readsock)};
+	    delete $writedebt{$i};
+	    vec($rin,fileno($readsock),1)=1;
+	    vec($win,fileno($writesock),1)=0;
+	    print STDERR "writedebt length ".length $buffer."\n";
+	    writer($readsock, $writesock, $buffer, length $buffer);
+	}
+    }
+
+    print STDERR "Assertion failed: nfound=$nfound after processing\n" if $nfound;
 }
+
+sub shutdowndir($$);
+
+sub writer($$$$) {
+    my ($readsock, $writesock, $buffer, $count) = @_; 
+    $offset=0;
+    if($count) {
+	while ($count) {
+	    $writeret = syswrite $writesock, $buffer, $count, $offset;
+	    unless($writeret) {
+		if ($! == EINPROGRESS) {
+		    $writedebt{fileno($writesock)} = substr $buffer, $offset;
+		    vec($rin,fileno($readsock),1)=0;
+		    vec($win,fileno($writesock),1)=1;
+		} else {
+		    # Shutdown this direction
+		    shutdowndir($readsock, $writesock);
+		}
+		last;
+	    }
+	    $count-=$writeret;
+	    $offset+=$writeret;
+	}
+    } else {
+	# Shutdown this direction
+	shutdowndir($readsock, $writesock);
+    }
+}
+
+sub shutdowndir($$) {
+    my ($readsock, $writesock) = @_; 
+    vec($rin,fileno($readsock),1)=0;
+    shutdown($readsock, 0);
+    shutdown($writesock, 1);
+    unless (vec($rin,fileno($writesock),1)) {
+	# close filehandles
+	delete $portmap{fileno($writesock)};
+	delete $portmap{fileno($readsock)};
+	close $readsock;
+	close $writesock;
+    }
+}
+sub killsock($) {
+    my $s = shift;
+    vec($rin, fileno($s), 1)=0;
+    vec($rout, fileno($s), 1)=0;
+    vec($win, fileno($s), 1)=0;
+    vec($wout, fileno($s), 1)=0;
+    delete $portmap{fileno($s)};
+    delete $writedebt{fileno($s)};
+    delete $socksinfo{fileno($s)};
+    close $s;
+}
+
+sub dumpsel() {
+    print STDERR "rin=(";
+    for(my $i=0; $i<100; ++$i) {
+	(print STDERR $i ," ") if vec($rin,$i,1)==1;
+    }
+    print STDERR ") win=(";
+    for(my $i=0; $i<100; ++$i) {
+	(print STDERR $i ," ") if vec($win,$i,1)==1;
+    }
+    print STDERR ")   rout=(";
+    for(my $i=0; $i<100; ++$i) {
+	(print STDERR $i ," ") if vec($rout,$i,1)==1;
+    }
+    print STDERR ") wout=(";
+    for(my $i=0; $i<100; ++$i) {
+	(print STDERR $i ," ") if vec($wout,$i,1)==1;
+    }
+    print STDERR ")\n";
+}
+
 
 sub es_noauth($);
 sub es_userauth($);
@@ -393,3 +489,4 @@ sub establishsocks_init_oneround($) {
 	$self->{state} = \&es_userauth;
     }
 }
+
