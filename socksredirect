@@ -33,21 +33,24 @@ bind(SS, sockaddr_in($porttolisten, inet_aton($addresstolisten))) or die "bind: 
 
 listen(SS,0) or die "listen: $!";
 
-my @sockets;
 my %portmap;
 my %socksinfo;
 
 my $rin = my $win = my $ein = '';
 vec($rin,fileno(SS),1) = 1;
 
-sub establishsocks($$$$$$);
+sub establishsocks_init($);
 
 for(;;){
     my $nfound;
     $nfound = select(my $rout=$rin, undef, undef, undef);
 
     my $buffer;
-    my $read;
+    my $readsock;
+    my $writesock;
+    my $readret;
+    my $writeret;
+    my $offset;
 
     die("select: $!") if $nfound==-1;
     
@@ -76,102 +79,196 @@ for(;;){
 	    close $s;
 	} else {
 	    print STDOUT "$destip:$destport\n";
-	    #my $si = { saddr=>$addresstoconnect, s
-	    my $so = establishsocks($addresstoconnect, $porttoconnect, $user, $password, $destip, $destport);
-	    unless($so){
-		print $s "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect (Requesting for $destip:$destport)\n";
-		close $s;
+
+	    my $so;
+	    socket($so, AF_INET, SOCK_STREAM, 0) or $so=undef;
+	    if($so && connect($so, sockaddr_in($porttoconnect, inet_aton($addresstoconnect)))) {
+		select $so; $|=1;
+		my $si = { 
+		    soaddr=>$addresstoconnect, 
+		    soport=>$porttoconnect, 
+		    souser=>$user, 
+		    sopassword=>$password, 
+		    srcip=>$srcip,
+		    srcport=>$srcport,
+		    destip=>$destip, 
+		    destport=>$destport,
+		    peer=>$s,
+		    so=>$so,
+		    state=>\&establishsocks_init,
+		    errortext=>"",
+		    bindip=>"",
+		    bindport=>"",
+		};
+		
+		$si->{state}($si);  # Call establishsocks_init
+		$socksinfo{fileno($so)}=$si; # When this disappear, portmapping begins
+		vec($rin, fileno($so), 1)=1;
+		# wait for reply from SOCKS server, serving other requests
+
 	    } else {
-		vec($rin,fileno($s),1)=1;
-		vec($rin,fileno($so),1)=1;
-		$portmap{fileno($s)}=$so;
-		$portmap{fileno($so)}=$s;
-		unshift @sockets, $s;
-		unshift @sockets, $so;
+		print $s "Error: Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect\n";
+		print STDERR "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect\n";
+		close $s;
 	    }
 	}
     }
-    foreach my $i (@sockets) {
-	next unless fileno($i);
-	if(vec($rout,fileno($i),1)) {
+    
+    # look for not yet negotiated SOCKS connections
+    foreach my $i (keys %socksinfo) {
+	if(vec($rout,$i,1)) {
+	    my $si = $socksinfo{$i};
 
-	    my $theother = $portmap{fileno($i)};
+	    # Continue negotiation with SOCKS5
+	    $si->{state}($si); # Next move
+		
+	    my $peer = $si->{peer};
+	    my $so = $si->{so};
+		
+	    if($si->{errortext}) {
+		print STDOUT "    $si->{srcip}:$si->{srcport} -> $si->{destip}:$si->{destport} ($si->{errortext})\n";  
+		print $peer "Error: $si->{errortext}\n";
+		vec($rin, fileno($so), 1)=0;
+		delete $socksinfo{fileno($so)}; # Stop SOCKS negotiation phase
+		close $so;
+		close $peer;
+		next;
+	    }
 
-            $read = sysread $i, $buffer, 1024;
-	    if($read) {
-		syswrite $theother, $buffer, $read;
+	    unless(defined $si->{state}) { 
+		# success, rewiring it to pormapper
+		print STDOUT "    $si->{srcip}:$si->{srcport} -> $si->{destip}:$si->{destport} ($si->{bindip}:$si->{bindport})\n";  
+		$portmap{fileno($peer)}=$so;
+		$portmap{fileno($so)}=$peer;
+		vec($rin, fileno($peer), 1)=1; # Begin receiving data from user
+		vec($rout, fileno($so), 1)=0; # Do not read data from SOCKS server without selecting it
+		delete $socksinfo{$i}; # Stop SOCKS negotiation phase
+		next;
+	    }  
+
+	    # Next phase of SOCKS connection
+	    # Server other things while waiting for it
+	}
+    }
+
+    # Looks for portmappers (already negotiated with SOCKS server)
+    foreach my $i (keys %portmap) {
+	if(vec($rout,$i,1)) {
+	    my $writesock     = $portmap{$i};
+	    my $readsock      = $portmap{fileno($writesock)};
+	    unless (fileno($readsock)==$i) {
+		print STDERR "Assertion failed: portmap is not paired?\n";
+	    }
+	    $readret = sysread $readsock, $buffer, 1024;
+	    $offset=0;
+	    if($readret) {
+		while ($readret) {
+		    $writeret = syswrite $writesock, $buffer, $readret, $offset;
+		    unless($writeret) {
+			
+		    }
+		    $readret-=$writeret;
+		    $offset+=$writeret;
+		}
 	    } else {
-		vec($rin,fileno($i),1)=0;
-		vec($rin,fileno($theother),1)=0;
-		delete $portmap{fileno($theother)};
-		delete $portmap{fileno($i)};
-		close $i;
-		close $theother;
+		vec($rin,fileno($readsock),1)=0;
+		vec($rin,fileno($writesock),1)=0;
+		delete $portmap{fileno($writesock)};
+		delete $portmap{fileno($readsock)};
+		close $readsock;
+		close $writesock;
 	    }
 	}
     }
 }
 
+sub es_noauth($);
+sub es_userauth($);
+sub es_userauth_recv($);
+sub es_readytosend($);
+sub es_finalizing($);
 
-sub establishsocks($$$$$$) {
-    my $so;
-    my ($addresstoconnect, $porttoconnect, $user, $password, $destip, $destport) = @_;
-
-    socket($so, AF_INET, SOCK_STREAM, 0) or return undef;
-    connect($so, sockaddr_in($porttoconnect, inet_aton($addresstoconnect))) or return undef;
-    select $so;
-    $|=1;
-    my $buf;
-    unless($user){
+sub establishsocks_init($) {
+    my $self = shift;
+    my $so = $self->{so};
+    unless ($self->{user}) {
 	print $so pack("CCC", 5, 1, 0);
-	read $so, $buf, 2;
-	my ($ver, $method) = unpack "CC", $buf;
-	$ver = -1 unless defined $ver;
-	unless($ver==5) {
-	    print STDERR " (socks version $ver?)";
-	    close $so;
-	    return undef;
-	}
-	$method = "EOF" unless defined $ver;
-	unless($method==0) {
-	    print STDERR " (auth method $method?)";
-	    close $so;
-	    return undef;
-	}
+        $self->{state} = \&es_noauth;
     } else {
 	print $so pack("CCC", 5, 1, 2);
-	read $so, $buf, 2;
-	my ($ver, $method) = unpack "CC", $buf;
-	$ver = -1 unless defined $ver;
-	unless($ver==5) {
-	    print STDERR " (socks version $ver?)";
-	    close $so;
-	    return undef;
-	}
-	$method = -1 unless defined $ver;
-	unless($method==2) {
-	    print STDERR " (auth method $method?)";
-	    close $so;
-	    return undef;
-	}
+	$self->{state} = \&es_userauth;
+    }
+}
+
+sub es_noauth($) {
+    my $self = shift;
+    my $so = $self->{so};
+    my $buf;
+
+    read $so, $buf, 2;
+    my ($ver, $method) = unpack "CC", $buf;
+    $ver = -1 unless defined $ver;
+    unless($ver==5) {
+	$self->{errortext} = "socks version $ver? (should be 5 - SOCKS5)";
+	return;
+    }
+    $method = "EOF" unless defined $ver;
+    unless($method==0) {
+	$self->{errortext} = "auth method $method? (should be 0 - noauth)";
+	return;
+    }
+    return es_readytosend($self);
+}
+
+sub es_userauth($) {
+    my $self = shift;
+    my $so = $self->{so};
+    my $buf;    
+    my $user = $self->{user};
+    my $password = $self->{password};
 
 
-	print $so pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
-	read $so, $buf, 2;
-	my ($authver, $status) = unpack "CC", $buf;
-	$authver = -1 unless defined $authver;
-	unless($authver==1) {
-	    print STDERR " (auth version $authver?)";
-	    close $so;
-	    return undef;
-	}
-	$status = -1 unless defined $status;
-	unless($status==0) {
-	    print STDERR " (auth failed $status)";
-	    close $so;
-	    return undef;
-	}
-    }    
+    read $so, $buf, 2;
+    my ($ver, $method) = unpack "CC", $buf;
+    $ver = -1 unless defined $ver;
+    unless($ver==5) {
+	$self->{errortext} = "socks version $ver? (should be 5)";
+	return;
+    }
+    $method = -1 unless defined $ver;
+    unless($method==2) {
+	$self->{errortext} = "auth method $method? (should be 2 - username/password)";
+	return;
+    }
+
+    print $so pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
+
+    $self->{state} = \&es_userauth_recv;
+}
+ 
+sub es_userauth_recv($) {
+    my $self = shift;
+    my $so = $self->{so};
+    my $buf;
+
+    read $so, $buf, 2;
+    my ($authver, $status) = unpack "CC", $buf;
+    $authver = -1 unless defined $authver;
+    unless($authver==1) {
+	$self->{errortext} = "auth version $authver? (should be 1)";
+	return;
+    }
+    $status = -1 unless defined $status;
+    unless($status==0) {
+	$self->{errortext} = "SOCKS5 authentication failed";
+	return;
+    }
+    return es_readytosend($self);
+}         
+
+sub es_readytosend($) {
+    my $self = shift;
+    my $so = $self->{so};
 
 =cut
         +----+-----+-------+------+----------+----------+
@@ -181,7 +278,15 @@ sub establishsocks($$$$$$) {
         +----+-----+-------+------+----------+----------+
 =cut
 
-    print $so pack("CCCC", 5, 1, 0, 1).inet_aton($destip).pack("n", $destport);
+    print $so pack("CCCC", 5, 1, 0, 1).inet_aton($self->{destip}).pack("n", $self->{destport});
+    $self->{state} = \&es_finalizing;
+}
+
+sub es_finalizing($) {
+    my $self = shift;
+    my $so = $self->{so}; 
+    my $buf;
+
 =cut
         +----+-----+-------+------+----------+----------+
         |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
@@ -194,9 +299,8 @@ sub establishsocks($$$$$$) {
     my ($ver, $rep, $rsv, $atyp, $bnd, $bndp) = unpack "CCCCLn", $buf;
     $ver = -1 unless defined $ver;  $rep = -1 unless defined $rep; $atyp = -1 unless defined $atyp;
     unless($ver==5) {
-	print STDERR " (socks version $ver after connect?)";
-	close $so;
-	return undef;
+	$self->{errortext} = "socks version $ver after connect? (should be 5)";
+	return;
     }
 =cut
 	     o  X'00' succeeded
@@ -211,21 +315,21 @@ sub establishsocks($$$$$$) {
 =cut
 
     unless($rep==0) {
-	if   ($rep==-1){ print STDERR " (disconnected)"; }
-	elsif($rep==1){ print STDERR " (general SOCKS server failure)"; }
-	elsif($rep==2){ print STDERR " (connection not allowed by ruleset)"; }
-	elsif($rep==3){ print STDERR " (Network unreachable)"; }
-	elsif($rep==4){ print STDERR " (Host unreachable)"; }
-	elsif($rep==5){ print STDERR " (Connection refused)"; }
-	elsif($rep==6){ print STDERR " (TTL expired)"; }
-	elsif($rep==7){ print STDERR " (Command not supported)"; }
-	elsif($rep==8){ print STDERR " (Address type not supported)"; }
-	else{ print STDERR " (reply $rep?)"; }
-	close $so;
-	return undef;
+	if   ($rep==-1){ $self->{errortext} = "SOCKS5 server suddenly disconnected"; }
+	elsif($rep==1){ $self->{errortext} = "general SOCKS5 server failure"; }
+	elsif($rep==2){ $self->{errortext} = "SOCKS5 connection not allowed by ruleset"; }
+	elsif($rep==3){ $self->{errortext} = "Network unreachable"; }
+	elsif($rep==4){ $self->{errortext} = "Host unreachable"; }
+	elsif($rep==5){ $self->{errortext} = "Connection refused"; }
+	elsif($rep==6){ $self->{errortext} = "TTL expired"; }
+	elsif($rep==7){ $self->{errortext} = "SOCKS5 Command not supported"; }
+	elsif($rep==8){ $self->{errortext} = "SOCKS5 Address type not supported"; }
+	else{ $self->{errortext} = "SOCKS5 reply $rep?"; }
+	return;
     }
 
-    print STDERR " (bound ".inet_ntoa(pack("L",$bnd)).":$bndp)";
+    $self->{bindip}   = inet_ntoa(pack("L",$bnd));
+    $self->{bindport} = $bndp;
 
-    return $so;
+    $self->{state} = undef; # finish negotiation
 }
