@@ -1,0 +1,230 @@
+#!/usr/bin/perl -w
+#
+# socksredirect: 
+#   iptables -t nat -A OUTPUT -p tcp ! -d localnetwork -j REDIERCT --to-ports 1234
+#   socksredirect 1234 address_of_socks_server [user passoword]
+#  
+#   Uses /proc/net/nf_conntrack to restore destination address and port
+#
+# Copyright (c) 2009 Vitaly "_Vi" Shukela. Some rights reserved.
+# 
+#
+
+my $rcsid = ''; $rcsid .= '$Id:$';
+
+use strict;
+use Socket;
+
+my $addresstolisten=shift;
+my $porttolisten=shift;
+my $addresstoconnect=shift;
+my $porttoconnect=shift;
+die("Usage: socksredirect address_to_listen port_to_listen address_of_socks_server [user password]\nPreparation: iptables -t nat -A OUTPUT -p tcp -d destination_to_be_socksified -j REDIERCT --to-ports port_to_listen\n") unless $porttoconnect;
+my $user=shift;
+my $password=shift;
+
+
+socket(SS, AF_INET, SOCK_STREAM, 0)  or die "socket: $!";
+
+setsockopt(SS, SOL_SOCKET, SO_REUSEADDR, pack("l", 1))   or die "setsockopt: $!";
+
+#INADDR_ANY
+bind(SS, sockaddr_in($porttolisten, inet_aton($addresstolisten))) or die "bind: $!";
+
+listen(SS,0) or die "listen: $!";
+
+my @sockets;
+my %portmap;
+my %socksinfo;
+
+my $rin = my $win = my $ein = '';
+vec($rin,fileno(SS),1) = 1;
+
+sub establishsocks($$$$$$);
+
+for(;;){
+    my $nfound;
+    $nfound = select(my $rout=$rin, undef, undef, undef);
+
+    my $buffer;
+    my $read;
+
+    die("select: $!") if $nfound==-1;
+    
+    if(vec($rout,fileno(SS),1)){
+	my $paddr = accept(S, SS);
+	my($port,$iaddr) = sockaddr_in($paddr);
+
+	my $srcip = inet_ntoa($iaddr);
+	my $srcport = $port;
+
+        print STDERR "$srcip:$port -> ";
+
+	my $destip;
+	my $destport;
+
+        open F, "</proc/net/nf_conntrack";
+	while(<F>) {
+	    /src=$srcip dst=([0-9.]+) sport=$srcport dport=(\d+)/ and $destip=$1 and $destport=$2;
+	}
+	close F;
+
+	unless($destip and $destport) {
+	    print STDERR "NULL?\n";
+	    print S "Sorry, this port is intended to be connected using conntrack\n";
+	    close S;
+	} else {
+	    print STDERR "$destip:$destport";
+	    my $so = establishsocks($addresstoconnect, $porttoconnect, $user, $password, $destip, $destport);
+	    unless($so){
+		print STDERR " (FAILED)\n";
+		print S "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect (Requesting for $destip:$destport)\n";
+		close S;
+	    } else {
+		print STDERR "\n";
+		vec($rin,fileno(S),1)=1;
+		vec($rin,fileno($so),1)=1;
+		$portmap{fileno(S)}=$so;
+		$portmap{fileno($so)}=*S;
+		unshift @sockets, *S;
+		unshift @sockets, $so;
+	    }
+	}
+    }
+    foreach my $i (@sockets) {
+	next unless fileno($i);
+	if(vec($rout,fileno($i),1)) {
+
+	    my $theother = $portmap{fileno($i)};
+
+            $read = sysread $i, $buffer, 1024;
+	    if($read) {
+		syswrite $theother, $buffer, $read;
+	    } else {
+		vec($rin,fileno($i),1)=0;
+		vec($rin,fileno($theother),1)=0;
+		delete $portmap{fileno($theother)};
+		delete $portmap{fileno($i)};
+		close $i;
+		close $theother;
+	    }
+	}
+    }
+}
+
+
+sub establishsocks($$$$$$) {
+    my ($addresstoconnect, $porttoconnect, $user, $password, $destip, $destport) = @_;
+
+    socket(SO, AF_INET, SOCK_STREAM, 0) or return undef;
+    connect(SO, sockaddr_in($porttoconnect, inet_aton($addresstoconnect))) or return undef;
+    select SO;
+    $|=1;
+    my $buf;
+    unless($user){
+	print SO pack("CCC", 5, 1, 0);
+	read SO, $buf, 2;
+	my ($ver, $method) = unpack "CC", $buf;
+	$ver = -1 unless defined $ver;
+	unless($ver==5) {
+	    print STDERR " (socks version $ver?)";
+	    close SO;
+	    return undef;
+	}
+	$method = "EOF" unless defined $ver;
+	unless($method==0) {
+	    print STDERR " (auth method $method?)";
+	    close SO;
+	    return undef;
+	}
+    } else {
+	print SO pack("CCC", 5, 1, 2);
+	read SO, $buf, 2;
+	my ($ver, $method) = unpack "CC", $buf;
+	$ver = -1 unless defined $ver;
+	unless($ver==5) {
+	    print STDERR " (socks version $ver?)";
+	    close SO;
+	    return undef;
+	}
+	$method = -1 unless defined $ver;
+	unless($method==2) {
+	    print STDERR " (auth method $method?)";
+	    close SO;
+	    return undef;
+	}
+
+
+	print SO pack("CC", 1, length($user)) . $user . pack("C", length($password)) . $password;
+	read SO, $buf, 2;
+	my ($authver, $status) = unpack "CC", $buf;
+	$authver = -1 unless defined $authver;
+	unless($authver==1) {
+	    print STDERR " (auth version $authver?)";
+	    close SO;
+	    return undef;
+	}
+	$status = -1 unless defined $status;
+	unless($status==0) {
+	    print STDERR " (auth failed $status)";
+	    close SO;
+	    return undef;
+	}
+    }    
+
+=cut
+        +----+-----+-------+------+----------+----------+
+        |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+        +----+-----+-------+------+----------+----------+
+        | 1  |  1  | X'00' |  1   | Variable |    2     |
+        +----+-----+-------+------+----------+----------+
+=cut
+
+    print SO pack("CCCC", 5, 1, 0, 1).inet_aton($destip).pack("n", $destport);
+=cut
+        +----+-----+-------+------+----------+----------+
+        |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+        +----+-----+-------+------+----------+----------+
+        | 1  |  1  | X'00' |  1   | Variable |    2     |
+        +----+-----+-------+------+----------+----------+
+=cut
+
+    read SO, $buf, 10;
+    my ($ver, $rep, $rsv, $atyp, $bnd, $bndp) = unpack "CCCCLn", $buf;
+    $ver = -1 unless defined $ver;  $rep = -1 unless defined $rep; $atyp = -1 unless defined $atyp;
+    unless($ver==5) {
+	print STDERR " (socks version $ver after connect?)";
+	close SO;
+	return undef;
+    }
+=cut
+	     o  X'00' succeeded
+             o  X'01' general SOCKS server failure
+             o  X'02' connection not allowed by ruleset
+             o  X'03' Network unreachable
+             o  X'04' Host unreachable
+             o  X'05' Connection refused
+             o  X'06' TTL expired
+             o  X'07' Command not supported
+             o  X'08' Address type not supported
+=cut
+
+    unless($rep==0) {
+	if   ($rep==-1){ print STDERR " (disconnected)"; }
+	elsif($rep==1){ print STDERR " (general SOCKS server failure)"; }
+	elsif($rep==2){ print STDERR " (connection not allowed by ruleset)"; }
+	elsif($rep==3){ print STDERR " (Network unreachable)"; }
+	elsif($rep==4){ print STDERR " (Host unreachable)"; }
+	elsif($rep==5){ print STDERR " (Connection refused)"; }
+	elsif($rep==6){ print STDERR " (TTL expired)"; }
+	elsif($rep==7){ print STDERR " (Command not supported)"; }
+	elsif($rep==8){ print STDERR " (Address type not supported)"; }
+	else{ print STDERR " (reply $rep?)"; }
+	close SO;
+	return undef;
+    }
+
+    print STDERR " (bound ".inet_ntoa(pack("L",$bnd)).":$bndp)";
+
+    return *SO;
+}
