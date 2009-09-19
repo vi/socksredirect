@@ -165,18 +165,32 @@ for(;;){
 		while ($readret) {
 		    $writeret = syswrite $writesock, $buffer, $readret, $offset;
 		    unless($writeret) {
-			
+			# Error. Shutting down socket
+			vec($rin,fileno($readsock),1)=0;
+			vec($rin,fileno($writesock),1)=0;
+			delete $portmap{fileno($writesock)};
+			delete $portmap{fileno($readsock)};
+			shutdown($readsock, 2);
+			shutdown($writesock, 2);
+			close $readsock;
+			close $writesock;
+			last;    
 		    }
 		    $readret-=$writeret;
 		    $offset+=$writeret;
 		}
 	    } else {
+		# Shutdown this way
 		vec($rin,fileno($readsock),1)=0;
-		vec($rin,fileno($writesock),1)=0;
-		delete $portmap{fileno($writesock)};
-		delete $portmap{fileno($readsock)};
-		close $readsock;
-		close $writesock;
+		shutdown($readsock, 0);
+		shutdown($writesock, 1);
+		unless (vec($rin,fileno($writesock),1)) {
+		    # close filehandles
+		    delete $portmap{fileno($writesock)};
+		    delete $portmap{fileno($readsock)};
+		    close $readsock;
+		    close $writesock;
+		}
 	    }
 	}
     }
