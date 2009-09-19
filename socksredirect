@@ -13,7 +13,8 @@
 my $rcsid = ''; $rcsid .= '$Id:$';
 
 use strict;
-use Socket;
+use Socket;  
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 
 my $addresstolisten=shift;
 my $porttolisten=shift;
@@ -123,8 +124,8 @@ for(;;){
 		# wait for reply from SOCKS server, serving other requests
 
 	    } else {
-		print $s "Error: Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect\n";
-		print STDERR "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect\n";
+		print $s "Error: Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect $!\n";
+		print STDERR "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect $!\n";
 		close $s;
 	    }
 	}
