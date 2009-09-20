@@ -21,14 +21,17 @@ use constant {
     READLENGTH=>1024
 };
 
+
 my $addresstolisten=shift;
 my $porttolisten=shift;
 my $addresstoconnect=shift;
 my $porttoconnect=shift;
-die("Usage: socksredirect address_to_listen port_to_listen address_of_socks_server [user password [oneround]]\nPreparation: iptables -t nat -A OUTPUT -p tcp -d destination_to_be_socksified -j REDIERCT --to-ports port_to_listen\n") unless $porttoconnect;
+die("Usage: socksredirect address_to_listen port_to_listen address_of_socks_server [user password [oneround [maxpend [maxconn]]]]\nPreparation: iptables -t nat -A OUTPUT -p tcp -d destination_to_be_socksified -j REDIERCT --to-ports port_to_listen\n") unless $porttoconnect;
 my $user=shift;
 my $password=shift;
 my $mode=shift||"";
+my $maxpend=shift||10;
+my $maxconn=shift||20;
 
 sub SIGPIPE {
     # just ignore it. The writer will handle.
@@ -57,11 +60,15 @@ my $rin = my $win = my $ein = '';
 vec($rin,fileno(SS),1) = 1;
 vec($rin,0,1) = 1;
 
+my $counter=0;
+my %ager;
+
 sub establishsocks_init($);
 sub establishsocks_oneround($);
 
 sub writer($$$$);
 sub killsock($);
+sub unregistersock($);
 
 my $rout = $rin;
 my $wout = $win;
@@ -77,19 +84,31 @@ my $offset;
 my $nfound;
 
 my $i;
+
+sub killall() {
+    my %union = map(($_=>0), (keys %portmap, keys %socksinfo, keys %pendingconnect, keys %writedebt));
+    map {open Q, "<&=", $_; killsock(*Q);} keys %union;
+}
+
 for(;;){
     $nfound = select($rout=$rin, $wout=$win, undef, undef);
 
-    die("select: $!") if $nfound==-1;
+    if($nfound==-1) {
+	print STDERR "select: $!\n";
+	killall();
+	$rin = $win = $ein = '';
+	vec($rin,fileno(SS),1) = 1;
+	vec($rin,0,1) = 1;
+	next;
+    }
 
     if(vec($rout,0,1)) {
 	--$nfound;
 	$_ = <STDIN>;
-	if(/k/) {
-	    my %union = map(($_=>0), (keys %portmap, keys %socksinfo, keys %pendingconnect, keys %writedebt));
-	    map {open Q, "<&=", $_; killsock(*Q);} keys %union;
+	if(/^k/) {
+	    killall();
 	}
-	if(/s/) {
+	if(/^s/) {
 	    print STDERR 
 		" m:",scalar keys %portmap,
 		" s:",scalar keys %socksinfo,
@@ -97,21 +116,82 @@ for(;;){
 		" d:",scalar keys %writedebt,
 		"\n";
 	}
-	if(/q/){
+	if(/^q/){
 	    last;
 	}
-	if(/f/) {
+	if(/^f/) {
 	    dumpsel;
 	}
+	if (/^c/) {
+	    sub checkhash($$) {
+		my ($h, $n) = @_;
+		foreach my $i (keys %$h) {
+		    open Q, ">&=", $i;
+		    unless(defined fileno(Q)) {
+			print STDERR "$i is invalid in $n";
+			unregistersock($i);
+		    }
+		}
+	    }
+	    checkhash(\%portmap, "portmap");
+	    checkhash(\%socksinfo, "socksinfo");
+	    checkhash(\%writedebt, "writedebt");
+	    checkhash(\%pendingconnect, "pendconnecting");
+	    foreach my $i (keys %portmap) {
+		my $writesock     = $portmap{$i};
+		my $readsock      = $portmap{fileno($writesock)};
+		print STDERR "$i -> ".fileno($writesock)." -> ".fileno($readsock)." in portmap\n" unless $i==fileno($readsock);
+	    }
+	    foreach my $i (keys %socksinfo) {
+		my $si = $socksinfo{$i};
+		unless(defined fileno($si->{peer})) {
+		    print STDERR "peer is invalid in socksinfo $i";
+		    if(defined fileno($si->{so})) {
+			close $si->{so};
+		    }
+		    unregistersock($i);
+		}
+	    }
+	}
+	if(/^l/) {
+	    print STDERR " maxconn=$maxconn  maxpend=$maxpend\n";
+	}
+	if(/^e(.*)/) {
+	    eval $1;
+	}
 	if(/\?/) {
-	    print STDERR " Stats Quit Fds Kill\n";
+	    print STDERR " Stats Quit Fds Kill fsCk Limits Eval\n";
 	}
     }
 
     if(vec($rout,fileno(SS),1)){
 	--$nfound;
+	while((scalar keys %pendingconnect)+(scalar keys %socksinfo)>$maxpend) {
+	    print STDERR "Pending limit reached:".(scalar keys %pendingconnect)."+".(scalar keys %socksinfo)." > $maxpend\n";
+	    my %union = map(($_=>0), (keys %portmap, keys %socksinfo));
+	    my $victim = [ sort { $ager{$a} <=> $ager{$b} } keys %union ]->[0];  # oldest of establishing sockets
+	    print STDERR "Asertion failed: victim not found\n" unless $victim;
+	    if(exists $socksinfo{$victim}) {
+		my $si = $socksinfo{$victim};
+		my $peer = $si->{peer};
+		if(defined fileno($peer)) {
+		    print $peer, "You inactive connection was sacrificed for the newer one\n";
+		    killsock($peer);	  
+		} else {
+		    print STDERR "    peer is invalid for $victim\n";
+		}
+	    }
+	    open Q, ">&=", $victim;
+	    unless(defined fileno(Q)) {
+		print STDERR  "    $victim is invalid\n";  
+		unregistersock($victim);
+	    } else {
+		killsock(*Q);
+	    }
+	}
 	my $s;
 	my $paddr = accept($s, SS);
+	$ager{fileno($s)}=++$counter;
 	if ($paddr) {
 	    fcntl($s, F_SETFL, O_NONBLOCK);
 	    my($port,$iaddr) = sockaddr_in($paddr);
@@ -139,6 +219,7 @@ for(;;){
 
 		my $so;
 		socket($so, AF_INET, SOCK_STREAM, 0) or $so=undef;
+		$ager{fileno($so)}=++$counter;
 		if($so) {
 		    fcntl($so, F_SETFL, O_NONBLOCK);
 		    select $so; $|=1;
@@ -173,6 +254,7 @@ for(;;){
 	if(vec($wout,$i,1)) {
 	    --$nfound;  
 	    vec($win,$i,1)=0;
+	    $ager{$i}=++$counter;
 	    delete $pendingconnect{$i};
 	    my $si = $socksinfo{$i};
 	    my $s = $si->{peer};
@@ -204,6 +286,7 @@ for(;;){
     foreach $i (keys %socksinfo) {
 	if(vec($rout,$i,1)) {
 	    --$nfound;
+	    $ager{$i}=++$counter;
 	    my $si = $socksinfo{$i};
 
 	    # Continue negotiation with SOCKS5
@@ -222,6 +305,22 @@ for(;;){
 
 	    unless(defined $si->{state}) { 
 		# success, rewiring it to pormapper
+		while((scalar keys %portmap)>$maxconn*2) {
+		    print STDERR "Connections limit reached\n";
+		    my $victim = [ sort { $ager{$a} <=> $ager{$b} } keys %portmap ]->[0];
+		    my $writesock     = $portmap{$victim};
+		    my $readsock      = $portmap{fileno($writesock)};
+		    if(defined fileno($writesock)) {
+			killsock($writesock);
+			if(defined fileno($readsock)) {
+			    killsock($readsock);
+			} else {
+			    unregistersock(fileno($writesock));
+			}
+		    } else {
+			unregistersock($victim);
+		    }
+		}
 		print STDOUT "    $si->{srcip}:$si->{srcport} -> $si->{destip}:$si->{destport} ($si->{bindip}:$si->{bindport})\n";  
 		$portmap{fileno($peer)}=$so;
 		$portmap{fileno($so)}=$peer;
@@ -239,6 +338,7 @@ for(;;){
     # Looks for portmappers (already negotiated with SOCKS server)
     foreach $i (keys %portmap) {
 	if(vec($rout,$i,1)) {
+	    $ager{$i}=++$counter;
 	    next if exists $socksinfo{$i}; # avoid sending to clients negotiation requests from SOCKS server (oneround mode)
 	    --$nfound;
 	    my $writesock     = $portmap{$i};
@@ -253,6 +353,7 @@ for(;;){
 
     foreach $i (keys %writedebt) {
 	if(vec($wout,$i,1)) {
+	    $ager{$i}=++$counter;
 	    --$nfound;
 	    my $buffer = $writedebt{$i};
 	    my $readsock     = $portmap{$i};
@@ -290,6 +391,7 @@ sub writer($$$$) {
 	    $count-=$writeret;
 	    $offset+=$writeret;
 	}
+	$ager{fileno($writesock)}=++$counter;
     } else {
 	# Shutdown this direction
 	shutdowndir($readsock, $writesock);
@@ -309,16 +411,27 @@ sub shutdowndir($$) {
 	close $writesock;
     }
 }
+sub unregistersock($) {
+    my $s = shift;
+    vec($rin, $s, 1)=0;
+    --$nfound if vec($rout, $s, 1);
+    vec($rout, $s, 1)=0;
+    vec($win, $s, 1)=0;
+    --$nfound if vec($wout, $s, 1);
+    vec($wout, $s, 1)=0;
+    delete $portmap{$s};
+    delete $writedebt{$s};
+    delete $socksinfo{$s};
+    delete $pendingconnect{$s};
+}
 sub killsock($) {
     my $s = shift;
-    vec($rin, fileno($s), 1)=0;
-    vec($rout, fileno($s), 1)=0;
-    vec($win, fileno($s), 1)=0;
-    vec($wout, fileno($s), 1)=0;
-    delete $portmap{fileno($s)};
-    delete $writedebt{fileno($s)};
-    delete $socksinfo{fileno($s)};
-    close $s;
+    if(defined fileno($s)) {
+	unregistersock(fileno($s));
+        close $s;
+    } else {
+	print STDERR "Attempting to kill closed socket\n";
+    }
 }
 
 sub dumpsel() {
