@@ -55,6 +55,7 @@ my %writedebt;
 
 my $rin = my $win = my $ein = '';
 vec($rin,fileno(SS),1) = 1;
+vec($rin,0,1) = 1;
 
 sub establishsocks_init($);
 sub establishsocks_oneround($);
@@ -80,6 +81,32 @@ for(;;){
     $nfound = select($rout=$rin, $wout=$win, undef, undef);
 
     die("select: $!") if $nfound==-1;
+
+    if(vec($rout,0,1)) {
+	--$nfound;
+	$_ = <STDIN>;
+	if(/k/) {
+	    my %union = map(($_=>0), (keys %portmap, keys %socksinfo, keys %pendingconnect, keys %writedebt));
+	    map {open Q, "<&=", $_; killsock(*Q);} keys %union;
+	}
+	if(/s/) {
+	    print STDERR 
+		" m:",scalar keys %portmap,
+		" s:",scalar keys %socksinfo,
+		" p:",scalar keys %pendingconnect,
+		" d:",scalar keys %writedebt,
+		"\n";
+	}
+	if(/q/){
+	    last;
+	}
+	if(/f/) {
+	    dumpsel;
+	}
+	if(/\?/) {
+	    print STDERR " Stats Quit Fds Kill\n";
+	}
+    }
 
     if(vec($rout,fileno(SS),1)){
 	--$nfound;
