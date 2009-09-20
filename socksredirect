@@ -17,6 +17,10 @@ use Socket qw(IPPROTO_TCP AF_INET SOCK_STREAM SOL_SOCKET SO_REUSEADDR SO_ERROR A
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use POSIX qw(EINPROGRESS);
 
+use constant {
+    READLENGTH=>1024
+};
+
 my $addresstolisten=shift;
 my $porttolisten=shift;
 my $addresstoconnect=shift;
@@ -147,7 +151,8 @@ for(;;){
 	    my $s = $si->{peer};
 	    my $so = $si->{so};
 
-	    unless(unpack("I", getsockopt($so, IPPROTO_TCP, SO_ERROR))==0){
+	    my $soerr = unpack("I", getsockopt($so, SOL_SOCKET, SO_ERROR));
+	    if($soerr==0){
 		$si->{state}($si);  # Call establishsocks_init
 		vec($rin, fileno($so), 1)=1;
 
@@ -160,8 +165,8 @@ for(;;){
 		# wait for reply from SOCKS server, serving other requests
 
 	    } else {
-		print $s "Error: Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect $!\n";
-		print STDERR "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect $!\n";
+		print $s "Error: Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect: $soerr\n";
+		print STDERR "Unable to establish connection to SOCSK5 $addresstoconnect:$porttoconnect: $soerr\n";
 		killsock($s);
 		killsock($so);
 	    }
@@ -214,7 +219,7 @@ for(;;){
 	    unless (fileno($readsock)==$i) {
 		print STDERR "Assertion failed: portmap is not paired?\n";
 	    }
-	    $readret = sysread $readsock, $buffer, 1024;
+	    $readret = sysread $readsock, $buffer, READLENGTH;
 	    writer($readsock, $writesock, $buffer, $readret);
 	}
     }
@@ -335,11 +340,15 @@ sub es_noauth($) {
     my $so = $self->{so};
     my $buf;
 
-    read $so, $buf, 2;
+    sysread $so, $buf, 2;
     my ($ver, $method) = unpack "CC", $buf;
     $ver = -1 unless defined $ver;
     unless($ver==5) {
-	$self->{errortext} = "socks version $ver? (should be 5 - SOCKS5)";
+	if($ver==-1){
+	    $self->{errortext} = "Unable to connect the SOCKS5 server $self->{soaddr}:$self->{soport}\n";
+	}else{
+	    $self->{errortext} = "socks version $ver? (should be 5 - SOCKS5)";
+	}
 	return;
     }
     $method = "EOF" unless defined $ver;
@@ -358,7 +367,7 @@ sub es_userauth($) {
     my $password = $self->{sopassword};
 
 
-    read $so, $buf, 2;
+    sysread $so, $buf, 2;
     my ($ver, $method) = unpack "CC", $buf;
     $ver = -1 unless defined $ver;
     unless($ver==5) {
@@ -383,7 +392,7 @@ sub es_userauth_recv($) {
     my $so = $self->{so};
     my $buf;
 
-    read $so, $buf, 2;
+    sysread $so, $buf, 2;
     my ($authver, $status) = unpack "CC", $buf;
     $authver = -1 unless defined $authver;
     unless($authver==1) {
@@ -429,7 +438,7 @@ sub es_finalizing($) {
         +----+-----+-------+------+----------+----------+
 =cut
 
-    read $so, $buf, 10;
+    sysread $so, $buf, 10;
     my ($ver, $rep, $rsv, $atyp, $bnd, $bndp) = unpack "CCCCLn", $buf;
     $ver = -1 unless defined $ver;  $rep = -1 unless defined $rep; $atyp = -1 unless defined $atyp;
     unless($ver==5) {
