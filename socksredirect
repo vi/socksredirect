@@ -204,7 +204,7 @@ for(;;){
 	    my $destip;
 	    my $destport;
 
-	    open F, "</proc/net/nf_conntrack";
+	    open F, "</proc/net/nf_conntrack" or print STDERR "Cannot open /proc/net/nf_conntrack\n";
 	    while(<F>) {
 		/src=$srcip dst=([0-9.]+) sport=$srcport dport=(\d+)/ and $destip=$1 and $destport=$2;
 	    }
