@@ -30,8 +30,8 @@ die("Usage: socksredirect address_to_listen port_to_listen address_of_socks_serv
 my $user=shift;
 my $password=shift;
 my $mode=shift||"";
-my $maxpend=shift||10;
-my $maxconn=shift||20;
+my $maxpend=shift||20;
+my $maxconn=shift||40;
 
 sub SIGPIPE {
     # just ignore it. The writer will handle.
