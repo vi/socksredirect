@@ -13,6 +13,7 @@ use strict;
 `cp header_common.h header.h`;
 
 open G, ">>header.h";
+open Q, ">generated.c";
 while(<*.c>) {
     open F, "<", $_;
 
@@ -33,11 +34,21 @@ while(<*.c>) {
 	    if(m!(void|char\*?|int)\s+(\w+)\s*\((.*)\)\s*{!) {
 		print G "$1 $2($3);\n";
 	    }
+=cut
+	    if(m!s_err_(\w+)\s*\((.*),\s*\"(.*)\"\)!) {
+		my $n = "s_err_".$1;
+		my $fd = $2;
+		my $text=$3;
+		print G "void s_err_$1(int fd);\n";
+		print Q "";
+	    }
+=cut
 	}
     }
     close F;
 }
 
+close Q;
 open F, "cmds.c";
 open H, ">cmds_init.c";
 open R, ">cmd_help.c";

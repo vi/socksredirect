@@ -27,9 +27,16 @@ void register_except(int fd, handler h) {
     FD_SET(fd, &ein);
     eha[fd]=h;
 }
+void unregister(int fd) {
+    FD_CLR(fd, &rin);
+    FD_CLR(fd, &win);
+    FD_CLR(fd, &ein);
+}
 
 
 int main(int argc, char* argv[]) {
+
+    setup_trace(argc, argv);
 
     FD_ZERO(&rin);
     FD_ZERO(&win);
