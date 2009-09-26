@@ -1,4 +1,5 @@
 #include "header.h"
+#include <signal.h>
 
 // vars
 int maxfd = 3;
@@ -33,10 +34,18 @@ void unregister(int fd) {
     FD_CLR(fd, &ein);
 }
 
+void sigpipe() {
+    fprintf(stderr, "SIGPIPE\n");
+}
 
 int main(int argc, char* argv[]) {
 
-    setup_trace(argc, argv);
+    setup_trace(argc, argv);    
+    {
+	struct sigaction sa = {sigpipe};
+	sigaction(SIGPIPE, &sa, NULL);
+    }
+
 
     FD_ZERO(&rin);
     FD_ZERO(&win);

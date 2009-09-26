@@ -33,6 +33,8 @@ void init_server_socket() {
 char buffer[1024];
 char* errmsg[FD_SETSIZE];
 int portmap[FD_SETSIZE];
+char* writedebt[FD_SETSIZE];
+int writedebtlen[FD_SETSIZE]={[0 ... FD_SETSIZE-1]=0};
 
 void ss_onconnect(int ss) {
     struct sockaddr_in sa,da,ka;
@@ -74,6 +76,8 @@ void ss_onconnect(int ss) {
     register_except(cs, s_except);
     portmap[cs]=s;
     portmap[s]=cs;  
+    writedebtlen[s]=0;
+    writedebtlen[cs]=0;
 
 }
 
@@ -85,6 +89,8 @@ void s_err(int s, char* msg) {
 	if(errno==EWOULDBLOCK) {
 	    errmsg[s]=msg;
 	    register_out(s, s_err2);
+	    shutdown(s, SHUT_RD);
+	    return;
 	}
     }
     close(s);
@@ -101,43 +107,97 @@ void ss_except(int ss) {
 }
 
 void s_ready(int s) {
+    int cs = portmap[s];
     ssize_t len = read(s, buffer, sizeof buffer);
-    if(!len || len==-1) {
+    if(len==-1) {
 	s_except(s);
+	return;
     }
-    if(portmap[s]) {
-	int cs = portmap[s];
-	register_in(s, s_ready);
-    
+    if (!len) {
+	shutdown(s, SHUT_RD);
+        if (cs) {
+	    shutdown(cs, SHUT_WR);
+	}
+	portmap[s]=0;
+	if (!portmap[cs]) {
+	    close(s);
+	    unregister(s);
+	    close(cs);
+	    unregister(cs);
+	}
+	return;
+    }
+    if(cs) {
 	ssize_t wlen = write(cs, buffer, len);
 	if (wlen==-1) {
 	    if(errno==EWOULDBLOCK) {
-		// TODO
+		debt(cs, buffer, len);
+		return;
 	    } else {
 		s_except(cs);
+		return;
 	    }
 	}
 	if (wlen<len) {
-	    // TODO
+	    debt(cs, buffer+wlen, len-wlen);
+	    return;
 	}
+	register_in(s, s_ready);
     } else {
 	fprintf(stderr, "Nowhere to route data from socket %d\n", s);
-	unregister(s);
-	unportmap(s);
+	kill(s);
     }
+}
+
+void debt(int s, char* buf, int len) {
+    char *buf2 = (char*)malloc(len);
+    memcpy(buf2, buf, len);
+    writedebt[s]=buf2;
+    writedebtlen[s]=len;
+    register_out(s, s_debt);
+}
+
+void s_debt(int s) {
+    char* buf = writedebt[s];
+    int len = writedebtlen[s];
+    // assert(len>0)
+    writedebtlen[s]=0;
+
+    int wlen;
+    wlen = write(s, buf, len);
+    if (wlen==-1 || !wlen) {
+	s_except(s);
+	return;
+    }
+    if(wlen<len) {
+	debt(s, buf+wlen, len-wlen);
+    } else {
+	int rs = portmap[s];
+	if(rs)	{
+	    register_in(rs, s_ready);
+	} else {
+	    fprintf(stderr, "Missing portmap after debt write\n");
+	}
+    }
+    free(buf);
+
+}
+
+void killsock(int s) {
+    if(writedebtlen[s]) {
+	free(writedebt[s]);
+    }
+    unregister(s);
+    unportmap(s);
+    close(s);
 }
 
 void s_except(int s) {
     int cs = portmap[s];
-    close(s);
-    unregister(s);       
-    unportmap(s);
+    killsock(s);
     if(cs) {
-	close(cs);
-	unregister(cs);
-	unportmap(cs);
-    } else {
-    }
+	killsock(cs);
+    } 
 }
 
 void unportmap(int s) {
@@ -148,4 +208,14 @@ void unportmap(int s) {
 	    portmap[i]=0;
 	}
     }
+}
+
+int ismapped(int s) {
+    int i;
+    for(i=0; i<FD_SETSIZE; ++i) {
+	if(portmap[i]==s) {
+	    return 1;
+	}
+    }
+    return 0;
 }
