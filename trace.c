@@ -6,13 +6,20 @@
 #include <string.h>
 
 const char* argv0;            
-
+        
 void print_trace() {
     write(2, "*** BACKTRACE ***\n", 19);
 
-    char buf[strlen(argv0)+30];
-    sprintf(buf, "gdb -batch -n -ex \"bt full\" %s %d", argv0, getpid());
-    system(buf);
+    char buf[30];
+    sprintf(buf, "%d", getpid());
+    //sprintf(buf, "gdb -batch -n -ex \"bt full\" %s %d", argv0, getpid());
+    int q = fork();
+    if(!q) {
+	execlp("gdb", "gdb", "-batch", "-n", "-ex", "bt full", argv0, buf, NULL);
+    } else {
+	wait(q);
+    }
+    //system(buf);
     write(2, "*** END OF BACKTRACE ***\n", 26);
 }
 

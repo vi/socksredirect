@@ -1,3 +1,3 @@
 all: 
 	./gen.pl
-	gcc -g3 *.c -o sr
+	gcc -g3 *.c -o sr -levent
