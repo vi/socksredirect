@@ -215,6 +215,28 @@ index 2358d78..c2def01 100644
  
     return 0;
  }
+diff --git a/xio-proxy.c b/xio-proxy.c
+index 4e67fe2..3b88c31 100644
+--- a/xio-proxy.c
++++ b/xio-proxy.c
+@@ -103,6 +103,17 @@ static int xioopen_proxy_connect2(int argc, const char *argv[], struct opt *opts
+       }
+       targetname = argv[1];
+       targetport = argv[2];
++   
++   extern union sockaddr_union _destname;
++   char targetname_[256]; char targetport_[16];
++   if(!strcasecmp(targetname,"REDIRECT")) {
++       strncpy(targetname_,inet_ntoa(_destname.ip4.sin_addr),256);
++       targetname=targetname_;
++   }
++   if(!strcasecmp(targetport,"REDIRECT")) {
++       sprintf(targetport_,"%d",ntohs(_destname.ip4.sin_port));
++       targetport=targetport_;
++   }
+ 
+    if (applyopts_single(xfd, opts, PH_INIT) < 0)  return -1;
+    applyopts(-1, opts, PH_INIT);
 diff --git a/xio-socks.c b/xio-socks.c
 index f8961a2..fece952 100644
 --- a/xio-socks.c
