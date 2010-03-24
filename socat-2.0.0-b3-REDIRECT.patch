@@ -1,0 +1,270 @@
+diff --git a/VERSION b/VERSION
+index 8d2ad59..ec8fa2c 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-"2.0.0-b3"
++"2.0.0-b3-REDIRECT"
+diff --git a/doc/socat.1 b/doc/socat.1
+index d87a4b7..9400561 100644
+--- a/doc/socat.1
++++ b/doc/socat.1
+@@ -228,6 +228,10 @@ set of <tt>rwb</tt> flags describes the transfer directions on the address\&'s
+ left side (read, write, and bidirectional, as seen by this address)\&. The second
+ set describes the required direction on the right side; empty means it is an
+ endpoint address form\&.
++.PP
++If you specify "REDIRECT" instead of address or port, socat will use address provided by "tcp-l"
++thing retrieved usin SO_ORIGINAL_DST option of getsockopt. It is useful for redirecting users to SOCKS
++server by iptables. Example: socat tcp-l:1234 socks4:127.0.0.1:REDIRECT:REDIRECT
+ .PP 
+ When parsing the addresses within an address chain \fBsocat\fP takes care of the
+ data transfer directions between consecutive addresses\&. For the first address
+@@ -3532,6 +3536,15 @@ IPv6\&.
+ .IP 
+ .IP "\fB\f(CW\fP\fP"
+ 
++
++.IP 
++.IP "\fB\f(CWsocat tcp-l:1234,fork,reuseaddr \&'socks5:REDIRECT:REDIRECT|tcp:127.0.0.1:1080'\&\fP\fP"
++
++.IP 
++Listen the port 1234 and connect to the redirected address using SOCKS5 server. Use "iptables -t nat -A OUTPUT <limitations> -p tcp -j REDIRECT --to-ports 1234" to set up the redirection rule\&.
++.IP 
++.IP "\fB\f(CW\fP\fP"
++
+ .IP 
+ .SH "DIAGNOSTICS"
+ 
+@@ -3644,6 +3657,12 @@ UDP-LISTEN, and
+ SCTP-LISTEN addresses, this variable is set to the
+ local port\&.
+ .IP 
++.IP "\fBSOCAT_DESTADDR\fP (output)"
++With all TCP-LISTEN, UDP-LISTEN, this variable is set to a string describing the destination (SO_ORIGINAL_DST) socket address\&.
++.IP 
++.IP "\fBSOCAT_DESTPORT\fP (output)"
++With TCP-LISTEN, UDP-LISTEN, this variable is set to the destination (SO_ORIGINAL_DST) port\&.
++.IP 
+ .IP "\fBSOCAT_TIMESTAMP\fP (output)"
+ With all RECVFROM addresses where address
+ option so-timestamp is applied, \fBsocat\fP sets this
+@@ -3750,7 +3769,7 @@ standard specifications available on the Internet for free\&.
+ .SH "VERSION"
+ 
+ .PP 
+-This man page describes version 2\&.0\&.0-b3 of \fBsocat\fP\&.
++This man page describes version 2\&.0\&.0-b3-REDIRECT of \fBsocat\fP\&.
+ .PP 
+ .SH "BUGS"
+ 
+diff --git a/filan.c b/filan.c
+index 6461e47..28a7053 100644
+--- a/filan.c
++++ b/filan.c
+@@ -20,6 +20,7 @@
+ 
+ #include "filan.h"
+ 
++union sockaddr_union _destname; /* linker error workaround */
+ 
+ struct sockopt {
+    int so;
+diff --git a/procan.c b/procan.c
+index 5c12aaf..910b87c 100644
+--- a/procan.c
++++ b/procan.c
+@@ -19,6 +19,8 @@
+ 
+ #include "procan.h"
+ 
++union sockaddr_union _destname; /* linker error workaround */
++
+ /* dirty workaround so we dont get an error on AIX when getting linked with
+    libwrap */
+ int allow_severity, deny_severity;
+diff --git a/socat.c b/socat.c
+index 7e9fdd2..4c4a3a8 100644
+--- a/socat.c
++++ b/socat.c
+@@ -52,7 +52,7 @@ static const char socatversion[] =
+       ;
+ static const char timestamp[] = __DATE__" "__TIME__;
+ 
+-const char copyright_socat[] = "socat by Gerhard Rieger - see www.dest-unreach.org";
++const char copyright_socat[] = "socat by Gerhard Rieger - see www.dest-unreach.org; Modified by Vitaly \"_Vi\" Shukela";
+ #if WITH_OPENSSL
+ const char copyright_openssl[] = "This product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit. (http://www.openssl.org/)";
+ const char copyright_ssleay[] = "This product includes software written by Tim Hudson (tjh@cryptsoft.com)";
+diff --git a/sysutils.c b/sysutils.c
+index e7489fb..6992eb2 100644
+--- a/sysutils.c
++++ b/sysutils.c
+@@ -496,6 +496,12 @@ int parseport(const char *portname, int ipproto) {
+       return result;
+    }
+ 
++   if(!strcasecmp(portname,"REDIRECT")) {
++       extern union sockaddr_union _destname;
++       result=ntohs(_destname.ip4.sin_port);
++       return result;
++   }
++
+    if ((se = getservbyname(portname, ipproto==IPPROTO_UDP?"udp":"tcp")) == NULL) {
+       Error2("cannot resolve service \"%s/%d\"", portname, ipproto);
+       return 0;
+diff --git a/xio-ip.c b/xio-ip.c
+index 365f066..8249b86 100644
+--- a/xio-ip.c
++++ b/xio-ip.c
+@@ -111,6 +111,7 @@ unsigned long res_opts() {
+    [::2]   (IPv6 address)
+    hostname (hostname resolving to IPv4 or IPv6 address)
+    hostname.domain (fq hostname resolving to IPv4 or IPv6 address)
++   "REDIRECT" (IPv4 address) - get redirected address from listening socket
+  service: the port specification; may be numeric or symbolic
+  family: PF_INET, PF_INET6, or PF_UNSPEC permitting both
+  socktype: SOCK_STREAM, SOCK_DGRAM
+@@ -161,6 +162,18 @@ int xiogetaddrinfo(const char *node, const char *service,
+       service = NULL; 
+    }
+ 
++   extern union sockaddr_union _destname; 
++   if (service && !strcmp(service,"REDIRECT")) {
++      port=ntohs(_destname.ip4.sin_port);
++      service=NULL;
++   }
++
++   char node_redirect_name[256];
++   if (node && !strcmp(node,"REDIRECT")) {
++      strncpy(node_redirect_name,inet_ntoa(_destname.ip4.sin_addr),256);
++      node=node_redirect_name;
++   }
++
+    /* the resolver functions might handle numeric forms of node names by
+       reverse lookup, that's not what we want.
+       So we detect these and handle them specially */
+@@ -209,6 +222,7 @@ int xiogetaddrinfo(const char *node, const char *service,
+ #endif /* WITH_IP6 */
+    }
+ 
++
+ #if HAVE_GETADDRINFO
+    if (node != NULL || service != NULL) {
+       struct addrinfo *record;
+diff --git a/xio-listen.c b/xio-listen.c
+index 2358d78..c2def01 100644
+--- a/xio-listen.c
++++ b/xio-listen.c
+@@ -24,6 +24,7 @@ const struct optdesc opt_fork    = { "fork",      NULL, OPT_FORK,        GROUP_C
+ const struct optdesc opt_range   = { "range",     NULL, OPT_RANGE,       GROUP_RANGE,  PH_ACCEPT, TYPE_STRING, OFUNC_SPEC };
+ #endif
+ 
++union sockaddr_union _destname; /* Accessed from other places, non-redirected address */
+ 
+ /*
+    applies and consumes the following option:
+@@ -121,8 +122,10 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+    union sockaddr_union _sockname;
+    union sockaddr_union *pa = &_peername;	/* peer address */
+    union sockaddr_union *la = &_sockname;	/* local address */
++   union sockaddr_union *da = &_destname;	/* destination address (before REDIRECT)*/
+    socklen_t pas = sizeof(_peername);	/* peer address size */
+    socklen_t las = sizeof(_sockname);	/* local address size */
++   socklen_t das = sizeof(_destname);	/* destination address size */
+    int result;
+ 
+    retropt_bool(opts, OPT_FORK, &dofork);
+@@ -225,6 +228,7 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+    while (true) {	/* but we only loop if fork option is set */
+       char peername[256];
+       char sockname[256];
++      char destname[256];
+       int ps;		/* peer socket */
+       salen = sizeof(struct sockaddr);
+ 
+@@ -260,11 +264,23 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+ 	       ps, la, las, strerror(errno));
+ 	 la = NULL;
+       }
++       #ifndef SO_ORIGINAL_DST
++	#define SO_ORIGINAL_DST 80
++       #endif
++      if (Getsockopt(ps, SOL_IP, SO_ORIGINAL_DST, &da->soa, &das) != 0) {
++	 Warn4("getsockopt(%d, %p, {"F_socklen"}): %s",
++	       ps, da, das, strerror(errno));
++	 da = NULL;
++      } 
+       Notice2("accepting connection from %s on %s",
+ 	      pa?
+ 	      sockaddr_info(&pa->soa, pas, peername, sizeof(peername)):"NULL",
+ 	      la?
+ 	      sockaddr_info(&la->soa, las, sockname, sizeof(sockname)):"NULL");
++      if(memcmp(&la->soa,&da->soa,sizeof(da->soa))) {
++         Notice1("actual non-REDIRECT-ed destination is %s",
++	      da?sockaddr_info(&da->soa, das, destname, sizeof(destname)):"NULL");
++      }
+ 
+       if (pa != NULL && la != NULL && xiocheckpeer(xfd, pa, la) < 0) {
+ 	 if (Shutdown(ps, 2) < 0) {
+@@ -336,6 +352,7 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+    /* set the env vars describing the local and remote sockets */
+    if (la != NULL)  xiosetsockaddrenv("SOCK", la, las, proto);
+    if (pa != NULL)  xiosetsockaddrenv("PEER", pa, pas, proto);
++   if (da != NULL)  xiosetsockaddrenv("DEST", da, das, proto);
+ 
+    return 0;
+ }
+diff --git a/xio-socks.c b/xio-socks.c
+index f8961a2..fece952 100644
+--- a/xio-socks.c
++++ b/xio-socks.c
+@@ -104,6 +104,18 @@ static int xioopen_socks4_connect(int argc, const char *argv[], struct opt *opts
+       targetport = argv[3];
+    }
+ 
++   extern union sockaddr_union _destname;
++   char targetname_[256]; char targetport_[16];
++   if(!strcasecmp(targetname,"REDIRECT")) {
++       strncpy(targetname_,inet_ntoa(_destname.ip4.sin_addr),256);
++       targetname=targetname_;
++   }
++   if(!strcasecmp(targetport,"REDIRECT")) {
++       sprintf(targetport_,"%d",ntohs(_destname.ip4.sin_port));
++       targetport=targetport_;
++   }
++
++
+    if (applyopts_single(xfd, opts, PH_INIT) < 0)  return -1;
+    applyopts(-1, opts, PH_INIT);
+ 
+diff --git a/xio-socks5.c b/xio-socks5.c
+index 7c08862..412a08c 100644
+--- a/xio-socks5.c
++++ b/xio-socks5.c
+@@ -88,6 +88,7 @@ static int xioopen_socks5_client(int argc, const char *argv[],
+    /* we expect the form: host:port */
+    xiosingle_t *xfd = &xxfd->stream;
+    const char *targetname, *targetservice;
++   char targetname_[256]; char targetservice_[16];
+    int level;
+    int result;
+ 
+@@ -112,6 +113,17 @@ static int xioopen_socks5_client(int argc, const char *argv[],
+       return -1;
+    }
+ 
++   extern union sockaddr_union _destname;
++   if(!strcasecmp(targetname,"REDIRECT")) {
++       strncpy(targetname_,inet_ntoa(_destname.ip4.sin_addr),256);
++       targetname=targetname_;
++   }
++   if(!strcasecmp(targetservice,"REDIRECT")) {
++       sprintf(targetservice_,"%d",ntohs(_destname.ip4.sin_port));
++       targetservice=targetservice_;
++   }
++
++
+    Notice2("opening connection to %s:%s using socks5",
+ 	   targetname, targetservice);
+ 
