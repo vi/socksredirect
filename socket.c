@@ -1,5 +1,12 @@
 #include "header.h"
 
+
+struct Client {
+    struct Client* peer;
+    struct bufferevent* be;
+    int socket;
+};
+
 struct event serverSocketEvent;
 void init_server_socket() {
     int ss = socket(PF_INET, SOCK_STREAM, 0);
@@ -47,8 +54,11 @@ void ss_onconnect(int ss, short event, void *arg) {
 
     event_add((struct event*)arg, NULL);
     
-    struct bufferevent *sBuf = bufferevent_new(s, s_ready, NULL, s_except, NULL);
-    bufferevent_enable(sBuf, EV_READ|EV_WRITE);
+    struct Client* sClient=(struct Client*)malloc(sizeof sClient);
+    sClient->peer=NULL;
+    sClient->socket = s;
+    sClient->be = bufferevent_new(s, s_ready, NULL, s_except, sClient);
+    bufferevent_enable(sClient->be, EV_READ|EV_WRITE);
 
 
 
@@ -92,6 +102,7 @@ void s_ready(struct bufferevent *s, void * arg) {
 
 
 void s_except(struct bufferevent *s, short what, void * arg) {
+    fprintf(stderr, "except\n");
     bufferevent_disable(s, EV_READ|EV_WRITE);
     bufferevent_free(s);
 }
