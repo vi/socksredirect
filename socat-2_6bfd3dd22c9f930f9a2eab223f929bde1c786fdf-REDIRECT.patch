@@ -1,0 +1,296 @@
+From c0902814a932bc987c56685801fe5a5c81861412 Mon Sep 17 00:00:00 2001
+From: Vitaly _Vi Shukela <public_vi@tut.by>
+Date: Thu, 25 Mar 2010 17:10:31 +0200
+Subject: [PATCH 1/4] Add .gitignore
+
+---
+ .gitignore |   14 ++++++++++++++
+ 1 files changed, 14 insertions(+), 0 deletions(-)
+ create mode 100644 .gitignore
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..f9401f1
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,14 @@
++*.o
++/filan
++/socat
++/procan
++*.a
++doc/socat.1
++doc/socat.html
++/configure
++config.h
++config.status
++config.log
++autom4te.cache
++Makefile
++.*.swp
+-- 
+1.7.0.3
+
+
+From 2bb40eec45365cd5955187b7569b0a5bac07d0d8 Mon Sep 17 00:00:00 2001
+From: Vitaly _Vi Shukela <public_vi@tut.by>
+Date: Thu, 25 Mar 2010 17:34:47 +0200
+Subject: [PATCH 2/4] Retrieve and save non-REDIRECT-ed destination address and port in listening sockets.
+
+---
+ xio-listen.c |   23 +++++++++++++++++++++++
+ xioopen.h    |    2 ++
+ 2 files changed, 25 insertions(+), 0 deletions(-)
+
+diff --git a/xio-listen.c b/xio-listen.c
+index 2358d78..1ea2d3f 100644
+--- a/xio-listen.c
++++ b/xio-listen.c
+@@ -24,6 +24,8 @@ const struct optdesc opt_fork    = { "fork",      NULL, OPT_FORK,        GROUP_C
+ const struct optdesc opt_range   = { "range",     NULL, OPT_RANGE,       GROUP_RANGE,  PH_ACCEPT, TYPE_STRING, OFUNC_SPEC };
+ #endif
+ 
++char redirect_hostname[255]; /* retreived host IP address for REDIRECT mode. Accessed from other places. */
++char redirect_port[32]; /* retrieved port number for REDIRECT mode. Accessed from other places. */
+ 
+ /*
+    applies and consumes the following option:
+@@ -119,10 +121,13 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+    char lisname[256];
+    union sockaddr_union _peername;
+    union sockaddr_union _sockname;
++   union sockaddr_union _destname;
+    union sockaddr_union *pa = &_peername;	/* peer address */
+    union sockaddr_union *la = &_sockname;	/* local address */
++   union sockaddr_union *da = &_destname;	/* destination address (before REDIRECT)*/
+    socklen_t pas = sizeof(_peername);	/* peer address size */
+    socklen_t las = sizeof(_sockname);	/* local address size */
++   socklen_t das = sizeof(_destname);	/* destination address size */
+    int result;
+ 
+    retropt_bool(opts, OPT_FORK, &dofork);
+@@ -225,6 +230,7 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+    while (true) {	/* but we only loop if fork option is set */
+       char peername[256];
+       char sockname[256];
++      char destname[256];
+       int ps;		/* peer socket */
+       salen = sizeof(struct sockaddr);
+ 
+@@ -260,11 +266,27 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+ 	       ps, la, las, strerror(errno));
+ 	 la = NULL;
+       }
++       #ifndef SO_ORIGINAL_DST
++	#define SO_ORIGINAL_DST 80
++       #endif
++      if (Getsockopt(ps, SOL_IP, SO_ORIGINAL_DST, &da->soa, &das) != 0) {
++	 Warn4("getsockopt(%d, %p, {"F_socklen"}): %s",
++	       ps, da, das, strerror(errno));
++	 da = NULL;
++      } 
++
++      strncpy(redirect_hostname,inet_ntoa(_destname.ip4.sin_addr),256);
++      sprintf(redirect_port,"%d", ntohs(_destname.ip4.sin_port));
++
+       Notice2("accepting connection from %s on %s",
+ 	      pa?
+ 	      sockaddr_info(&pa->soa, pas, peername, sizeof(peername)):"NULL",
+ 	      la?
+ 	      sockaddr_info(&la->soa, las, sockname, sizeof(sockname)):"NULL");
++      if(memcmp(&la->soa,&da->soa,sizeof(da->soa))) {
++         Notice1("actual non-REDIRECT-ed destination is %s",
++	      da?sockaddr_info(&da->soa, das, destname, sizeof(destname)):"NULL");
++      }
+ 
+       if (pa != NULL && la != NULL && xiocheckpeer(xfd, pa, la) < 0) {
+ 	 if (Shutdown(ps, 2) < 0) {
+@@ -336,6 +358,7 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
+    /* set the env vars describing the local and remote sockets */
+    if (la != NULL)  xiosetsockaddrenv("SOCK", la, las, proto);
+    if (pa != NULL)  xiosetsockaddrenv("PEER", pa, pas, proto);
++   if (da != NULL)  xiosetsockaddrenv("DEST", da, das, proto);
+ 
+    return 0;
+ }
+diff --git a/xioopen.h b/xioopen.h
+index 8984ebc..a7e2fb5 100644
+--- a/xioopen.h
++++ b/xioopen.h
+@@ -99,5 +99,7 @@ extern int xioopen_makedual(xiofile_t *file);
+ #  define retropt_gidt(x,y,z) retropt_ulong(x,y,z)
+ #endif
+ 
++extern char redirect_hostname[255]; /* retreived host IP address for REDIRECT mode. */
++extern char redirect_port[32]; /* retrieved port number for REDIRECT mode. */
+ 
+ #endif /* !defined(__xioopen_h_included) */
+-- 
+1.7.0.3
+
+
+From a5d5a3643865037f6d76fa4bf9412ee2df96fcfa Mon Sep 17 00:00:00 2001
+From: Vitaly _Vi Shukela <public_vi@tut.by>
+Date: Thu, 25 Mar 2010 17:34:07 +0200
+Subject: [PATCH 3/4] REDIRECT target address and port for ip, proxy, socks and socks5
+
+---
+ xio-ip.c     |   11 +++++++++++
+ xio-proxy.c  |    7 +++++++
+ xio-socks.c  |    8 ++++++++
+ xio-socks5.c |    8 ++++++++
+ 4 files changed, 34 insertions(+), 0 deletions(-)
+
+diff --git a/xio-ip.c b/xio-ip.c
+index 365f066..4574f01 100644
+--- a/xio-ip.c
++++ b/xio-ip.c
+@@ -111,6 +111,7 @@ unsigned long res_opts() {
+    [::2]   (IPv6 address)
+    hostname (hostname resolving to IPv4 or IPv6 address)
+    hostname.domain (fq hostname resolving to IPv4 or IPv6 address)
++   "REDIRECT" (IPv4 address) - get redirected address from listening socket
+  service: the port specification; may be numeric or symbolic
+  family: PF_INET, PF_INET6, or PF_UNSPEC permitting both
+  socktype: SOCK_STREAM, SOCK_DGRAM
+@@ -161,6 +162,15 @@ int xiogetaddrinfo(const char *node, const char *service,
+       service = NULL; 
+    }
+ 
++   if (service && !strcmp(service,"REDIRECT")) {
++      port=atoi(redirect_port);
++      service=NULL;
++   }
++
++   if (node && !strcmp(node,"REDIRECT")) {
++      node=redirect_hostname;
++   }
++
+    /* the resolver functions might handle numeric forms of node names by
+       reverse lookup, that's not what we want.
+       So we detect these and handle them specially */
+@@ -209,6 +219,7 @@ int xiogetaddrinfo(const char *node, const char *service,
+ #endif /* WITH_IP6 */
+    }
+ 
++
+ #if HAVE_GETADDRINFO
+    if (node != NULL || service != NULL) {
+       struct addrinfo *record;
+diff --git a/xio-proxy.c b/xio-proxy.c
+index 4e67fe2..198a1cc 100644
+--- a/xio-proxy.c
++++ b/xio-proxy.c
+@@ -103,6 +103,13 @@ static int xioopen_proxy_connect2(int argc, const char *argv[], struct opt *opts
+       }
+       targetname = argv[1];
+       targetport = argv[2];
++   
++   if(!strcasecmp(targetname,"REDIRECT")) {
++       targetname=redirect_hostname;
++   }
++   if(!strcasecmp(targetport,"REDIRECT")) {
++       targetport=redirect_port;
++   }
+ 
+    if (applyopts_single(xfd, opts, PH_INIT) < 0)  return -1;
+    applyopts(-1, opts, PH_INIT);
+diff --git a/xio-socks.c b/xio-socks.c
+index f8961a2..fc82526 100644
+--- a/xio-socks.c
++++ b/xio-socks.c
+@@ -104,6 +104,14 @@ static int xioopen_socks4_connect(int argc, const char *argv[], struct opt *opts
+       targetport = argv[3];
+    }
+ 
++   if(!strcasecmp(targetname,"REDIRECT")) {
++       targetname=redirect_hostname;
++   }
++   if(!strcasecmp(targetport,"REDIRECT")) {
++       targetport=redirect_port;
++   }
++
++
+    if (applyopts_single(xfd, opts, PH_INIT) < 0)  return -1;
+    applyopts(-1, opts, PH_INIT);
+ 
+diff --git a/xio-socks5.c b/xio-socks5.c
+index 7c08862..2990947 100644
+--- a/xio-socks5.c
++++ b/xio-socks5.c
+@@ -88,6 +88,7 @@ static int xioopen_socks5_client(int argc, const char *argv[],
+    /* we expect the form: host:port */
+    xiosingle_t *xfd = &xxfd->stream;
+    const char *targetname, *targetservice;
++   char targetname_[256]; char targetservice_[16];
+    int level;
+    int result;
+ 
+@@ -112,6 +113,13 @@ static int xioopen_socks5_client(int argc, const char *argv[],
+       return -1;
+    }
+ 
++   if(!strcasecmp(targetname,"REDIRECT")) {
++       targetname=redirect_hostname;
++   }
++   if(!strcasecmp(targetservice,"REDIRECT")) {
++       targetservice=redirect_port;
++   }
++
+    Notice2("opening connection to %s:%s using socks5",
+ 	   targetname, targetservice);
+ 
+-- 
+1.7.0.3
+
+
+From ef9569ae5030141fc4d317b15cf2bdc85b931368 Mon Sep 17 00:00:00 2001
+From: Vitaly _Vi Shukela <public_vi@tut.by>
+Date: Thu, 25 Mar 2010 17:43:57 +0200
+Subject: [PATCH 4/4] Add information about REDIRECT to manual
+
+---
+ doc/socat.yo |   13 +++++++++++++
+ 1 files changed, 13 insertions(+), 0 deletions(-)
+
+diff --git a/doc/socat.yo b/doc/socat.yo
+index dc83081..ce7aea8 100644
+--- a/doc/socat.yo
++++ b/doc/socat.yo
+@@ -253,6 +253,10 @@ left side (read, write, and bidirectional, as seen by this address). The second
+ set describes the required direction on the right side; empty means it is an
+ endpoint address form.
+ 
++If you specify "REDIRECT" instead of address or port, socat will use address provided by "tcp-l"
++thing retrieved usin <tt>SO_ORIGINAL_DST</tt> option of getsockopt. It is useful for redirecting users to SOCKS
++server by iptables. Example: <tt>socat tcp-l:1234 socks4:127.0.0.1:REDIRECT:REDIRECT</tt>
++
+ When parsing the addresses within an address chain socat() takes care of the
+ data transfer directions between consecutive addresses. For the first address
+ the directions are bidirectional per default, or unidirectional when when
+@@ -3365,6 +3369,11 @@ dit(bf(tt(socat - 'SSL,verify=0|SCTP6:ip6hostname:8888')))
+ here two processes on different hosts communicate using openssl over SCTP on
+ IPv6.
+ 
++label(EXAMPLE_REDIRECT_SOCKS5)
++dit(bf(tt(socat 'tcp-l:1234,reuseaddr,fork' 'socks5:REDIRECT:REDIRECT|tcp:127.0.0.1:1080')))
++
++Listen the port 1234 and connect to the redirected address using SOCKS5 server. Use <tt>iptables -t nat -A OUTPUT <limitations> -p tcp -j REDIRECT --to-ports 1234</tt> to set up the redirection rule.
++
+ dit(bf(tt()))
+ 
+ 
+@@ -3469,6 +3478,10 @@ link(UDP-LISTEN)(ADDRESS_UDP_LISTEN), and
+ link(SCTP-LISTEN)(ADDRESS_SCTP_LISTEN) addresses, this variable is set to the
+ local port.
+ 
++dit(bf(SOCAT_DESTADDR) (output)) With all TCP-LISTEN, UDP-LISTEN, this variable is set to a string describing the destination (SO_ORIGINAL_DST) socket address.
++
++dit(bf(SOCAT_DESTPORT) (output)) With TCP-LISTEN, UDP-LISTEN, this variable is set to the destination (SO_ORIGINAL_DST) port.
++
+ dit(bf(SOCAT_TIMESTAMP) (output)) With all RECVFROM addresses where address
+ option link(so-timestamp)(OPTION_SO_TIMESTAMP) is applied, socat() sets this
+ variable to the resulting timestamp.
+-- 
+1.7.0.3
+
