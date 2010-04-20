@@ -67,7 +67,19 @@ void print_fdinfo()
 	    } else {
 		fprintf(stderr, "%c", 'z' - i + fdinfo[i].peerfd);
 	    }
-	}
+	} else {
+	    fprintf(stderr, " ");
+	}  
+    }
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "fdread:");
+    for (i = 0; i <= m; ++i) {
+	if (fdinfo[i].status) {
+	    fprintf(stderr, "%c",  "NWRB"[fdinfo[i].writeready+2*fdinfo[i].readready]);
+	} else {
+	    fprintf(stderr, " ");
+	}  
     }
     fprintf(stderr, "\n");
 }
@@ -227,7 +239,7 @@ int main(int argc, char *argv[])
 		    continue;
 		}
 
-		printf("%s:%d -> %s->%d\n", inet_ntoa(sa.sin_addr),
+		printf("%s:%d -> %s:%d\n", inet_ntoa(sa.sin_addr),
 		       ntohs(sa.sin_port), inet_ntoa(da.sin_addr),
 		       ntohs(da.sin_port));
 
@@ -266,7 +278,7 @@ int main(int argc, char *argv[])
 
 		/* Set up events */
 
-		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP ;
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET ;
 		ev.data.fd = client;
 		if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, client, &ev) < 0) {
 		    fprintf(stderr, "epoll set insertion error\n");
@@ -276,7 +288,7 @@ int main(int argc, char *argv[])
 		    continue;
 		}
 
-		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
 		ev.data.fd = sockssocket;
 		if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, sockssocket, &ev) < 0) {
 		    fprintf(stderr, "epoll peer set insertion error\n");
@@ -295,6 +307,10 @@ int main(int argc, char *argv[])
 		fdinfo[sockssocket].status='S';
 		fdinfo[sockssocket].da=da;
 		fdinfo[client].da=da;
+		fdinfo[client].writeready=0;
+		fdinfo[client].readready=0;
+		fdinfo[sockssocket].writeready=0;
+		fdinfo[sockssocket].readready=0;
 
 
 	    } else {
@@ -310,15 +326,15 @@ int main(int argc, char *argv[])
 		if(events[n].events&EPOLLIN) {
 		    fdinfo[fd].readready = 1;
 		    readready=1;
-		    fprintf(stderr,"%d IN\n", fd);
+		    //fprintf(stderr,"%d IN\n", fd);
 		}
 		if(events[n].events&EPOLLOUT) {
 		    fdinfo[fd].writeready = 1;
 		    writeready=1;
-		    fprintf(stderr,"%d OUT\n", fd);
+		    //fprintf(stderr,"%d OUT\n", fd);
 		}           
 		if(events[n].events&EPOLLRDHUP) {
-		    fprintf(stderr,"%d RDHUP\n", fd);
+		    //fprintf(stderr,"%d RDHUP\n", fd);
 		    fdinfo[fd].readready = 0;
 		    switch(status) {
 			case 'C': 
@@ -326,13 +342,11 @@ int main(int argc, char *argv[])
 			    shutdown(fd, SHUT_RD);
 			    break;
 			case 'S': 
+			case '0':
 			case '1': 
 			case '2': 
-			    status='.';  
-			    peerstatus='.';
 			    write(peerfd, "Premature EOF from SOCKS5 server\n", 77-44);
-			    close(fd);
-			    close(peerfd);
+			    status='.';  
 			    break;
 			case '|': 
 			    status='s'; 
@@ -342,23 +356,18 @@ int main(int argc, char *argv[])
 			    break;
 			case 'r':
 			    status='.'; // Close if cannot both send and recv
-			    peerstatus='.';
-			    close(fd);
-			    close(peerfd);
 			    break; 
 		    }
-		    fdinfo[fd].status=status;
-		    fdinfo[peerfd].status=peerstatus;
 		}
 		if(events[n].events&(EPOLLERR|EPOLLHUP) ) {
-		    fprintf(stderr,"%d HUP\n", fd);
+		    //fprintf(stderr,"%d HUP\n", fd);
 		    status='.';
 		}
 
 		if(status=='S' && writeready) {
 		    if (!socks_username) {
 			char socks_connect_request[3 + 4 + 4 + 2];	/* Noauth method offer + connect command + IP address + port */
-			sprintf(socks_connect_request, "\x5\x1\x0"       "\x5\x1\x0\x1"    "XXXX"       "XX" );
+			memcpy(socks_connect_request,  "\x5\x1\x0"       "\x5\x1\x0\x1"    "XXXX"       "XX" , 3+4+4+2);
 			/*                                      |              |     |         |          |
 							      no auth        connect |        IP address  |
 										    IPv4                 port	*/
@@ -375,6 +384,7 @@ int main(int argc, char *argv[])
 			case 'S':
 			case '0':
                             nn = read(fd, buf, 2);
+			    //fprintf(stderr, "SOCKS5 phase 0 reply: %02x%02x\n", buf[0], buf[1]);
 			    if(nn!=2) {
 				write(peerfd, "Not exactly 2 bytes is received from SOCKS5 server. This situation is not handeled.\n", 132-48);
 				status='.';
@@ -390,12 +400,15 @@ int main(int argc, char *argv[])
 				status='.';
 				break;
 			    }
+			    status='1';
 			    break;
 			case '1':
-                            nn = read(fd, buf, 11);
-			    if(nn!=11) {
+                            nn = read(fd, buf, 10);
+			    //fprintf(stderr, "SOCKS5 phase 1 reply: %02x%02x%02x%02x...\n", buf[0], buf[1], buf[2], buf[3]);
+			    if(nn<10) {
 				write(peerfd, "Less then 11 bytes is received from SOCKS5 server. This situation is not handeled.\n", 131-48);
 				status='.';
+				print_trace();
 				break;
 			    }
 			    if(buf[0]!=5) {
@@ -437,8 +450,14 @@ int main(int argc, char *argv[])
 			case '|':
 			case 'r':
 			    if(fdinfo[peerfd].writeready) {
+				int q;
 				nn = read(fd, buf, sizeof buf);
-				write(peerfd, buf, nn);
+				q=write(peerfd, buf, nn);
+				if(q!=nn) {
+				    fprintf(stderr, "Error, wrote only %s bytes instead of %d\n", q, nn);
+				    status='.';
+				    break;
+				}
 				fdinfo[peerfd].writeready=0;
 				fdinfo[fd].readready=0;
 			    }
