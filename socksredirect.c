@@ -26,14 +26,15 @@ struct {
        i - connected client, but already cannot send to him
 
        S - pending connection to SOCKS5 server
-       1 - got initial response
-       2 - got auth methods list response 
+       0 - sent response
+       1 - got auth method choice response
 
        | - bidirectional connected peer
-       s - can only send (half-shutdown)
-       r - can onty recv (half-shutdown)
+       s - we can only send (half-shutdown)
+       r - we can only recv (half-shutdown)
        . - closed
-     */
+     */   
+    struct sockaddr_in da;
 } fdinfo[MAXFD] = { [0 ... MAXFD - 1] = {0, 0, 0}};
 
 char *argv0;                     // Close if cannot both send and recv
@@ -93,6 +94,7 @@ void bad_signal()
     exit(2);
 }
 
+char buf[65536];
 
 int main(int argc, char *argv[])
 {
@@ -261,6 +263,7 @@ int main(int argc, char *argv[])
 		    }
 		}
 
+
 		/* Set up events */
 
 		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP ;
@@ -284,22 +287,14 @@ int main(int argc, char *argv[])
 		}
 		
 
-		if (!socks_username) {
-		    char socks_connect_request[3 + 4 + 4 + 2];	/* Noauth method offer + connect command + IP address + port */
-                    sprintf(socks_connect_request, "\x5\x1\x0"       "\x5\x1\x0\x1"    "XXXX"       "XX" );
-		    /*                                      |              |     |         |          |
-							  no auth        connect |        IP address  |
-		                                                                IPv4                 port	*/
-		    memcpy(socks_connect_request+3+4   , &da.sin_addr,4);
-		    memcpy(socks_connect_request+3+4+4 , &da.sin_port,2);
-		    
-		}
 
 		/* Not we need to go through epoll_wait and wait when sockssocket will be ready for sending */
 		fdinfo[client].peerfd = sockssocket;
 		fdinfo[sockssocket].peerfd = client;
 		fdinfo[client].status='C';
 		fdinfo[sockssocket].status='S';
+		fdinfo[sockssocket].da=da;
+		fdinfo[client].da=da;
 
 
 	    } else {
@@ -307,15 +302,19 @@ int main(int argc, char *argv[])
 		int peerfd=fdinfo[fd].peerfd;
 		int status = fdinfo[fd].status;
 		int peerstatus = fdinfo[peerfd].status;
+		char writeready=0;
+		char readready=0;
 
 		if(fdinfo[peerfd].peerfd != fd) { fprintf(stderr, "Hmmm...\n"); }
 
 		if(events[n].events&EPOLLIN) {
 		    fdinfo[fd].readready = 1;
+		    readready=1;
 		    fprintf(stderr,"%d IN\n", fd);
 		}
 		if(events[n].events&EPOLLOUT) {
 		    fdinfo[fd].writeready = 1;
+		    writeready=1;
 		    fprintf(stderr,"%d OUT\n", fd);
 		}           
 		if(events[n].events&EPOLLRDHUP) {
@@ -353,9 +352,106 @@ int main(int argc, char *argv[])
 		}
 		if(events[n].events&(EPOLLERR|EPOLLHUP) ) {
 		    fprintf(stderr,"%d HUP\n", fd);
-		    
+		    status='.';
 		}
 
+		if(status=='S' && writeready) {
+		    if (!socks_username) {
+			char socks_connect_request[3 + 4 + 4 + 2];	/* Noauth method offer + connect command + IP address + port */
+			sprintf(socks_connect_request, "\x5\x1\x0"       "\x5\x1\x0\x1"    "XXXX"       "XX" );
+			/*                                      |              |     |         |          |
+							      no auth        connect |        IP address  |
+										    IPv4                 port	*/
+			memcpy(socks_connect_request+3+4   , &fdinfo[fd].da.sin_addr,4);
+			memcpy(socks_connect_request+3+4+4 , &fdinfo[fd].da.sin_port,2);
+
+			write(fd, socks_connect_request, 3+4+4+2);				
+			status='0';
+		    }
+		}
+		if(readready) {
+		    int nn;
+		    switch(status) {
+			case 'S':
+			case '0':
+                            nn = read(fd, buf, 2);
+			    if(nn!=2) {
+				write(peerfd, "Not exactly 2 bytes is received from SOCKS5 server. This situation is not handeled.\n", 132-48);
+				status='.';
+				break;
+			    }
+			    if(buf[0]!=5 || (buf[1]!=0 && buf[1]!=255)) {
+				write(peerfd, "Not SOCKS5 reply from SOCKS5 server\n", 84-48);
+				status='.';
+				break;
+			    }
+			    if(buf[1]==255) {
+				write(peerfd, "Authentication requred on SOCKS5 server\n", 88-48);
+				status='.';
+				break;
+			    }
+			    break;
+			case '1':
+                            nn = read(fd, buf, 11);
+			    if(nn!=11) {
+				write(peerfd, "Less then 11 bytes is received from SOCKS5 server. This situation is not handeled.\n", 131-48);
+				status='.';
+				break;
+			    }
+			    if(buf[0]!=5) {
+				write(peerfd, "Not SOCKS5 reply from SOCKS5 server\n", 84-48);
+				status='.';
+				break;
+			    }
+			    if(buf[1]!=0) {
+				switch(buf[1]) {
+				    case 1: write(peerfd, "general SOCKS server failure\n", 89-60); break;
+				    case 2: write(peerfd, "connection not allowed by ruleset\n",  94-60); break; 
+				    case 3: write(peerfd, "Network unreachable\n", 80-60); break; 
+				    case 4: write(peerfd, "Host unreachable\n", 77-60); break; 
+				    case 5: write(peerfd, "Connection refused\n", 79-60); break; 
+				    case 6: write(peerfd, "TTL expired\n", 72-60); break; 
+				    case 7: write(peerfd, "Command not supported\n", 82-60); break; 
+				    case 8: write(peerfd, "Address type not supported\n", 87-60); break; 
+				    default: write(peerfd,"Unknown error at SOCKS5 server\n", 91-60); break; 
+				}
+				status='.';
+			    }
+			    if(buf[3]!=1) {
+				write(peerfd, "Not an IPv4 address in SOCKS5 reply\n", 84-48);
+				status='.';
+				break;
+			    }
+			    if(peerstatus=='c') {
+				shutdown(fd, SHUT_WR);
+				shutdown(peerfd, SHUT_RD);
+				status='r';
+				peerstatus='s';
+			    } else {
+				/* peerstatus is 'C' */
+                                status='|';
+				peerstatus='|';
+			    }
+			    break;
+
+			case '|':
+			case 'r':
+			    if(fdinfo[peerfd].writeready) {
+				nn = read(fd, buf, sizeof buf);
+				write(peerfd, buf, nn);
+				fdinfo[peerfd].writeready=0;
+				fdinfo[fd].readready=0;
+			    }
+			    break;
+		    }
+		}
+		if (status=='.') {
+		    peerstatus='.';
+		    close(fd);
+		    close(peerfd);
+		}
+		fdinfo[fd].status=status;
+		fdinfo[peerfd].status=peerstatus;
 	    }
 	}
     }
