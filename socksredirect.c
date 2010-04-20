@@ -16,29 +16,27 @@
 
 struct {
     int peerfd;
+    char writeready;
+    char readready;
     char status;
     /*
+       States:
        C - connected client
-       c - connected client, write-ready
+       c - connected client, but has already signed off sending anything (cannot recv from him)
+       i - connected client, but already cannot send to him
 
        S - pending connection to SOCKS5 server
        1 - got initial response
        2 - got auth methods list response 
-       3 - got connection succeed response
 
-       | - bidirectional connected peer (idle, can send both here and to peer)
-       s - bidirectional connected peer (idle, can send here, not to peer)
-       p - bidirectional connected peer (idle, can send to peer, not here)
-       - - bidirectional connected peer (idle, cannot send (write is not ready))
-       > - can only send (half-shutdown)
-       ) - can only send (half-shutdown), but not write-ready
-       < - can onty recv (half-shutdown)
-       ( - can onty recv (half-shutdown), but peer is not write-ready
+       | - bidirectional connected peer
+       s - can only send (half-shutdown)
+       r - can onty recv (half-shutdown)
        . - closed
      */
-} fdinfo[MAXFD] = { [0 ... MAXFD - 1] = {0, 0}};
+} fdinfo[MAXFD] = { [0 ... MAXFD - 1] = {0, 0, 0}};
 
-char *argv0;
+char *argv0;                     // Close if cannot both send and recv
 
 /* Unrelated to the main task */
 void print_fdinfo()
@@ -231,15 +229,6 @@ int main(int argc, char *argv[])
 		       ntohs(sa.sin_port), inet_ntoa(da.sin_addr),
 		       ntohs(da.sin_port));
 
-		ev.events = EPOLLIN;
-		ev.data.fd = client;
-		if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, client, &ev) < 0) {
-		    fprintf(stderr, "epoll set insertion error\n");
-		    print_trace();
-		    write(client, "epoll set insertion error\n", 26);
-		    close(client);
-		    continue;
-		}
 
 		/* Now start connecting to SOCKS5 server */
 
@@ -272,6 +261,29 @@ int main(int argc, char *argv[])
 		    }
 		}
 
+		/* Set up events */
+
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP ;
+		ev.data.fd = client;
+		if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, client, &ev) < 0) {
+		    fprintf(stderr, "epoll set insertion error\n");
+		    print_trace();
+		    write(client, "epoll set insertion error\n", 26);
+		    close(client);
+		    continue;
+		}
+
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+		ev.data.fd = sockssocket;
+		if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, sockssocket, &ev) < 0) {
+		    fprintf(stderr, "epoll peer set insertion error\n");
+		    print_trace();
+		    write(client, "epoll peer set insertion error\n", 31);
+		    close(client);
+		    continue;
+		}
+		
+
 		if (!socks_username) {
 		    char socks_connect_request[3 + 4 + 4 + 2];	/* Noauth method offer + connect command + IP address + port */
                     sprintf(socks_connect_request, "\x5\x1\x0"       "\x5\x1\x0\x1"    "XXXX"       "XX" );
@@ -284,10 +296,66 @@ int main(int argc, char *argv[])
 		}
 
 		/* Not we need to go through epoll_wait and wait when sockssocket will be ready for sending */
+		fdinfo[client].peerfd = sockssocket;
+		fdinfo[sockssocket].peerfd = client;
+		fdinfo[client].status='C';
+		fdinfo[sockssocket].status='S';
 
 
 	    } else {
-		//do_use_fd(events[n].data.fd);
+		int fd=events[n].data.fd;
+		int peerfd=fdinfo[fd].peerfd;
+		int status = fdinfo[fd].status;
+		int peerstatus = fdinfo[peerfd].status;
+
+		if(fdinfo[peerfd].peerfd != fd) { fprintf(stderr, "Hmmm...\n"); }
+
+		if(events[n].events&EPOLLIN) {
+		    fdinfo[fd].readready = 1;
+		    fprintf(stderr,"%d IN\n", fd);
+		}
+		if(events[n].events&EPOLLOUT) {
+		    fdinfo[fd].writeready = 1;
+		    fprintf(stderr,"%d OUT\n", fd);
+		}           
+		if(events[n].events&EPOLLRDHUP) {
+		    fprintf(stderr,"%d RDHUP\n", fd);
+		    fdinfo[fd].readready = 0;
+		    switch(status) {
+			case 'C': 
+			    status='c'; 
+			    shutdown(fd, SHUT_RD);
+			    break;
+			case 'S': 
+			case '1': 
+			case '2': 
+			    status='.';  
+			    peerstatus='.';
+			    write(peerfd, "Premature EOF from SOCKS5 server\n", 77-44);
+			    close(fd);
+			    close(peerfd);
+			    break;
+			case '|': 
+			    status='s'; 
+			    peerstatus='r';
+			    shutdown(fd, SHUT_RD);
+			    shutdown(peerfd, SHUT_WR);
+			    break;
+			case 'r':
+			    status='.'; // Close if cannot both send and recv
+			    peerstatus='.';
+			    close(fd);
+			    close(peerfd);
+			    break; 
+		    }
+		    fdinfo[fd].status=status;
+		    fdinfo[peerfd].status=peerstatus;
+		}
+		if(events[n].events&(EPOLLERR|EPOLLHUP) ) {
+		    fprintf(stderr,"%d HUP\n", fd);
+		    
+		}
+
 	    }
 	}
     }
