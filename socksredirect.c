@@ -340,8 +340,6 @@ int main(int argc, char *argv[])
 		char writeready=0;
 		char readready=0;
 
-		if(fdinfo[peerfd].peerfd != fd) { fprintf(stderr, "Hmmm...\n"); }
-
 		if(events[n].events&EPOLLIN) {
 		    fdinfo[fd].readready = 1;
 		    readready=1;
