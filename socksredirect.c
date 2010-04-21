@@ -14,6 +14,10 @@
 
 #define MAXFD 4096		/* Not checked for overflow anywhere */
 
+#ifndef SPLICE_F_NONBLOCK
+    #define SPLICE_F_NONBLOCK	2
+#endif
+
 struct {
     int peerfd;
     char writeready;
@@ -490,16 +494,16 @@ int main(int argc, char *argv[])
 
 			case '|':
 			case 'r':
-			    if(fdinfo[peerfd].writeready) {
+			    {
 				int q;
 				for(;;) {
-				    q=splice(fd, NULL, fdinfo[fd].pipe, NULL, 65536, 0);
+				    q=splice(fd, NULL, fdinfo[fd].pipe, NULL, 65536, SPLICE_F_NONBLOCK);
 				    if(q<=0) {
 					fdinfo[fd].readready=0;
 					break;
 				    }
 				    fprintf(stderr, "Spliced %d bytes to pipe\n", q);
-				    q=splice(fdinfo[fd].pipeout, NULL, peerfd, NULL, q, 0);
+				    q=splice(fdinfo[fd].pipeout, NULL, peerfd, NULL, q, SPLICE_F_NONBLOCK);
 				    if(q<=0) {
 					fdinfo[peerfd].writeready=0;
 					break;
@@ -511,7 +515,7 @@ int main(int argc, char *argv[])
 			case 'P':
 			    if(fdinfo[peerfd].writeready) {
 				int q;
-				q=splice(fd, NULL, peerfd, NULL, 65536, 0);
+				q=splice(fd, NULL, peerfd, NULL, 65536, SPLICE_F_NONBLOCK);
 				fprintf(stderr, "Spliced %d bytes of debt\n", q);
 			    }
 		    }
@@ -520,7 +524,7 @@ int main(int argc, char *argv[])
 		    if(status=='|' || status=='s') {
 			int q;
 			for(;;) {
-			    q=splice(fdinfo[peerfd].pipeout, NULL, peerfd, NULL, q, 0);
+			    q=splice(fdinfo[peerfd].pipeout, NULL, peerfd, NULL, q, SPLICE_F_NONBLOCK);
 			    if(q<=0) {
 				fdinfo[fd].writeready=0;
 				writeready=0;
@@ -528,7 +532,7 @@ int main(int argc, char *argv[])
 			    }
 			    fprintf(stderr, "Spliced %d bytes from pipe\n", q);
 
-			    q=splice(fd, NULL, fdinfo[peerfd].pipe, NULL, 65536, 0);
+			    q=splice(fd, NULL, fdinfo[peerfd].pipe, NULL, 65536, SPLICE_F_NONBLOCK);
 			    if(q<=0) {
 				fdinfo[peerfd].readready=0;
 				break;
