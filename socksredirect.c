@@ -516,6 +516,27 @@ int main(int argc, char *argv[])
 			    }
 		    }
 		}
+		if(writeready) {
+		    if(status=='|' || status=='s') {
+			int q;
+			for(;;) {
+			    q=splice(fdinfo[peerfd].pipeout, NULL, peerfd, NULL, q, 0);
+			    if(q<=0) {
+				fdinfo[fd].writeready=0;
+				writeready=0;
+				break;
+			    }
+			    fprintf(stderr, "Spliced %d bytes from pipe\n", q);
+
+			    q=splice(fd, NULL, fdinfo[peerfd].pipe, NULL, 65536, 0);
+			    if(q<=0) {
+				fdinfo[peerfd].readready=0;
+				break;
+			    }
+			    fprintf(stderr, "    Spliced %d bytes to pipe\n", q);
+			}
+		    }
+		}
 		if (status=='.' || !status) {
 		    peerstatus=0;
 		    status=0;
