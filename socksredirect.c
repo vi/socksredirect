@@ -33,8 +33,12 @@ struct {
        s - we can only send (half-shutdown)
        r - we can only recv (half-shutdown)
        . - closed
+
+       P - this is a pipe, peerfd should be some socket
      */   
     struct sockaddr_in da;
+    int pipe; // recv'ed data is spliced to this pipe
+    int pipeout; // output pipe end
 } fdinfo[MAXFD] = { [0 ... MAXFD - 1] = {0, 0, 0}};
 
 char *argv0;                     // Close if cannot both send and recv
@@ -106,7 +110,7 @@ void bad_signal()
     exit(2);
 }
 
-char buf[65536];
+char buf[64];
 
 int main(int argc, char *argv[])
 {
@@ -276,18 +280,20 @@ int main(int argc, char *argv[])
 		}
 
 
-		/* Set up events */
-
-		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET ;
-		ev.data.fd = client;
-		if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, client, &ev) < 0) {
-		    fprintf(stderr, "epoll set insertion error\n");
-		    print_trace();
-		    write(client, "epoll set insertion error\n", 26);
+		/* Set up events and pipes and fdinfo*/
+		
+		int cpipefd[2], spipefd[2];
+		int cret, sret;
+		cret=pipe2(cpipefd, O_NONBLOCK);
+		sret=pipe2(spipefd, O_NONBLOCK);
+		if(cret<0 || sret<0) {
+		    perror("pipe2");
 		    close(client);
-		    continue;
+		    close(sockssocket);
+		    if(cret>=0) { close(cpipefd[0]); close(cpipefd[1]);  }
+		    if(sret>=0) { close(spipefd[0]); close(spipefd[1]);  }
 		}
-
+		
 		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
 		ev.data.fd = sockssocket;
 		if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, sockssocket, &ev) < 0) {
@@ -297,20 +303,29 @@ int main(int argc, char *argv[])
 		    close(client);
 		    continue;
 		}
-		
-
 
 		/* Not we need to go through epoll_wait and wait when sockssocket will be ready for sending */
-		fdinfo[client].peerfd = sockssocket;
 		fdinfo[sockssocket].peerfd = client;
-		fdinfo[client].status='C';
 		fdinfo[sockssocket].status='S';
 		fdinfo[sockssocket].da=da;
+		fdinfo[sockssocket].writeready=0;
+		fdinfo[sockssocket].readready=0;
+		fdinfo[client].peerfd = sockssocket;
+		fdinfo[client].status='C';
 		fdinfo[client].da=da;
 		fdinfo[client].writeready=0;
 		fdinfo[client].readready=0;
-		fdinfo[sockssocket].writeready=0;
-		fdinfo[sockssocket].readready=0;
+
+		fdinfo[cpipefd[0]].status='P';
+		fdinfo[cpipefd[0]].peerfd = sockssocket;
+		fdinfo[client].pipe=cpipefd[1];
+		fdinfo[client].pipeout=cpipefd[0];
+
+		fdinfo[spipefd[0]].status='P';
+		fdinfo[spipefd[0]].peerfd = client;
+		fdinfo[sockssocket].pipe=spipefd[1];
+		fdinfo[sockssocket].pipeout=spipefd[0];
+		
 
 
 	    } else {
@@ -338,6 +353,8 @@ int main(int argc, char *argv[])
 		    fdinfo[fd].readready = 0;
 		    switch(status) {
 			case 'C': 
+			    fprintf(stderr, "This branch should not happed\n");
+			    print_trace();
 			    status='c'; 
 			    shutdown(fd, SHUT_RD);
 			    break;
@@ -353,6 +370,8 @@ int main(int argc, char *argv[])
 			    peerstatus='r';
 			    shutdown(fd, SHUT_RD);
 			    shutdown(peerfd, SHUT_WR);
+			    close(fdinfo[fd].pipe);
+			    close(fdinfo[fd].pipeout);
 			    break;
 			case 'r':
 			    status='.'; // Close if cannot both send and recv
@@ -435,39 +454,79 @@ int main(int argc, char *argv[])
 				status='.';
 				break;
 			    }
-			    if(peerstatus=='c') {
-				shutdown(fd, SHUT_WR);
-				shutdown(peerfd, SHUT_RD);
-				status='r';
-				peerstatus='s';
-			    } else {
-				/* peerstatus is 'C' */
-                                status='|';
-				peerstatus='|';
+
+			    /* SOCKS5 connection successed. Setting up piping. */
+
+			    /* peerstatus is 'C' */
+			    status='|';
+			    peerstatus='|';
+
+			    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET ;
+			    ev.data.fd = peerfd;
+			    if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, peerfd, &ev) < 0) {
+				write(peerfd, "epoll set insertion error\n", 26);
+				status='.';
+				continue;
 			    }
+			    
+			    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET ;
+			    ev.data.fd = fdinfo[fd].pipeout;
+			    if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, fdinfo[fd].pipeout, &ev) < 0) {
+				write(peerfd, "epoll set insertion error\n", 26);
+				status='.';
+				continue;
+			    }
+			    
+			    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET ;
+			    ev.data.fd = fdinfo[peerfd].pipeout;
+			    if (epoll_ctl(kdpfd, EPOLL_CTL_ADD, fdinfo[peerfd].pipeout, &ev) < 0) {
+				write(peerfd, "epoll set insertion error\n", 26);
+				status='.';
+				continue;
+			    }
+			    
+
 			    break;
 
 			case '|':
 			case 'r':
 			    if(fdinfo[peerfd].writeready) {
 				int q;
-				nn = read(fd, buf, sizeof buf);
-				q=write(peerfd, buf, nn);
-				if(q!=nn) {
-				    fprintf(stderr, "Error, wrote only %s bytes instead of %d\n", q, nn);
-				    status='.';
-				    break;
+				for(;;) {
+				    q=splice(fd, NULL, fdinfo[fd].pipe, NULL, 65536, 0);
+				    if(q<=0) {
+					fdinfo[fd].readready=0;
+					break;
+				    }
+				    fprintf(stderr, "Spliced %d bytes to pipe\n", q);
+				    q=splice(fdinfo[fd].pipeout, NULL, peerfd, NULL, q, 0);
+				    if(q<=0) {
+					fdinfo[peerfd].writeready=0;
+					break;
+				    }
+				    fprintf(stderr, "    Spliced %d bytes from pipe\n", q);
 				}
-				fdinfo[peerfd].writeready=0;
-				fdinfo[fd].readready=0;
 			    }
 			    break;
+			case 'P':
+			    if(fdinfo[peerfd].writeready) {
+				int q;
+				q=splice(fd, NULL, peerfd, NULL, 65536, 0);
+				fprintf(stderr, "Spliced %d bytes of debt\n", q);
+			    }
 		    }
 		}
-		if (status=='.') {
-		    peerstatus='.';
+		if (status=='.' || !status) {
+		    peerstatus=0;
+		    status=0;
 		    close(fd);
 		    close(peerfd);
+		    close(fdinfo[fd].pipe);
+		    close(fdinfo[fd].pipeout);
+		    close(fdinfo[peerfd].pipe);
+		    close(fdinfo[peerfd].pipeout);
+		    fdinfo[fdinfo[fd].pipeout].status=0;
+		    fdinfo[fdinfo[peerfd].pipeout].status=0;
 		}
 		fdinfo[fd].status=status;
 		fdinfo[peerfd].status=peerstatus;
