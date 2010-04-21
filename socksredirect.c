@@ -493,7 +493,7 @@ int main(int argc, char *argv[])
 			case '|':
 			case 'r':
 			    {
-				int q;
+				int q,w;
 				for(;;) {
 				    q=splice(fd, NULL, fdinfo[fd].pipe, NULL, 65536, SPLICE_F_NONBLOCK);
 				    if(q<=0) {
@@ -501,12 +501,12 @@ int main(int argc, char *argv[])
 					break;
 				    }
 				    fprintf(stderr, "Spliced %d bytes to pipe\n", q);
-				    q=splice(fdinfo[fd].pipeout, NULL, peerfd, NULL, q, SPLICE_F_NONBLOCK);
-				    if(q<=0) {
+				    w=splice(fdinfo[fd].pipeout, NULL, peerfd, NULL, q, SPLICE_F_NONBLOCK);
+				    if(w<q) {
 					fdinfo[peerfd].writeready=0;
 					break;
 				    }
-				    fprintf(stderr, "    Spliced %d bytes from pipe\n", q);
+				    fprintf(stderr, "    Spliced %d bytes from pipe\n", w);
 				}
 			    }
 			    break;
@@ -520,17 +520,17 @@ int main(int argc, char *argv[])
 		}
 		if(writeready) {
 		    if(status=='|' || status=='s') {
-			int q;
+			int q=1,w;
 			for(;;) {
-			    q=splice(fdinfo[peerfd].pipeout, NULL, peerfd, NULL, q, SPLICE_F_NONBLOCK);
-			    if(q<=0) {
+			    w=splice(fdinfo[fd].pipeout, NULL, fd, NULL, q, SPLICE_F_NONBLOCK);
+			    if(w<q) {
 				fdinfo[fd].writeready=0;
 				writeready=0;
 				break;
 			    }
-			    fprintf(stderr, "Spliced %d bytes from pipe\n", q);
+			    fprintf(stderr, "Spliced %d bytes from pipe\n", w);
 
-			    q=splice(fd, NULL, fdinfo[peerfd].pipe, NULL, 65536, SPLICE_F_NONBLOCK);
+			    q=splice(peerfd, NULL, fdinfo[fd].pipe, NULL, 65536, SPLICE_F_NONBLOCK);
 			    if(q<=0) {
 				fdinfo[peerfd].readready=0;
 				break;
